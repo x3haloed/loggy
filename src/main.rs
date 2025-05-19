@@ -15,6 +15,8 @@ use bytes::Bytes;
 use actix_web::HttpRequest;
 use tokio::sync::broadcast::{channel, Sender};
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::IntervalStream;
+use std::time::Duration;
 
 // Metrics counters
 static LOGS_INGESTED: AtomicU64 = AtomicU64::new(0);
@@ -296,6 +298,9 @@ async fn mcp_sse(data: web::Data<AppState>, req: HttpRequest) -> impl Responder 
     let init = tokio_stream::iter(vec![
         Ok::<Bytes, actix_web::Error>(Bytes::from_static(b"event: endpoint\ndata: /mcp/sse\n\n")),
     ]);
+    // Keep-alive comments to satisfy SSE client timeouts
+    let keep_alive = IntervalStream::new(tokio::time::interval(Duration::from_secs(15)))
+        .map(|_| Ok::<Bytes, actix_web::Error>(Bytes::from_static(b": keep-alive\n\n")));
     let broadcast = BroadcastStream::new(rx).filter_map(|res| {
         match res {
             Ok(msg) => {
@@ -305,7 +310,8 @@ async fn mcp_sse(data: web::Data<AppState>, req: HttpRequest) -> impl Responder 
             Err(_) => None,
         }
     });
-    let stream = init.chain(broadcast);
+    // Merge initial event, broadcast, and keep-alive streams
+    let stream = init.merge(broadcast).merge(keep_alive);
     HttpResponse::Ok()
         .append_header(("Content-Type", "text/event-stream"))
         .append_header(("Cache-Control", "no-cache"))
