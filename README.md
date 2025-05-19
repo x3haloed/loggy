@@ -1,45 +1,112 @@
-# loggy
+# Loggy
 
-`loggy` is a Rust-based MCP (Model Context Protocol) server for ingesting, storing, and querying application logs locally via an embedded libSQL database.
+A fast, embeddable MCP log server for local development, LLM debugging, and app observability. Accepts logs via NDJSON and OTLP, stores in libSQL, and exposes a full MCP (Model Context Protocol) server for search and tool integration.
 
-Features
---------
-- HTTP ingestion of newline-delimited JSON (NDJSON) (`/logs/ndjson`)
-- OpenTelemetry Logs (OTLP) ingestion over HTTP (`/v1/logs`)
-- JSON-RPC 2.0 over SSE (`/mcp/sse`) for tool discovery and invocation
-- HTTP RPC endpoints for quick tool calls (`/tools/list`, `/tools/call`)
-- Prometheus-style health and metrics endpoints (`/healthz`, `/metrics`)
-- Full-text search with FTS5, plus structured filters by timestamp, level, service
-- Metadata enrichment: host name, process ID, plus arbitrary JSON attributes
+## Features
+- Ingest logs via NDJSON or OTLP (HTTP)
+- Store logs in a local libSQL database (file or in-memory)
+- Full-text and structured search
+- MCP server with SSE endpoint for Cursor and other LLM tools
+- Cross-platform: macOS, Windows, Linux (x86_64 and arm64)
 
-Getting Started
----------------
+---
 
-### Prerequisites
+## Building
 
-- Rust (1.70+)
-- (no external DB; uses embedded SQLite via libSQL)
+You need Rust (https://rustup.rs/) and a recent toolchain.
 
-### Building
-
-```bash
-git clone https://github.com/yourorg/loggy.git
-cd loggy
+```sh
 cargo build --release
 ```
 
-### Running
+The binary will be at `target/release/loggy` (or `.exe` on Windows).
 
-```bash
-# in-memory mode (ephemeral)
-cargo run --release -- --port 8080 --db-url ":memory:"
+---
 
-# file-backed mode (persistent)
-cargo run --release -- --port 8080 --db-url "./loggy.db"
+## Publishing for Multiple Platforms
+
+Use the provided `publish.sh` script to build and package for multiple platforms and architectures:
+
+```sh
+./publish.sh macos           # Build for macOS (x86_64 and arm64)
+./publish.sh windows         # Build for Windows (x86_64 and arm64)
+./publish.sh linux           # Build for Linux (x86_64 and arm64)
+./publish.sh macos windows   # Build for both macOS and Windows
 ```
 
-- `--port`  — HTTP listening port (default `8080`)
-- `--db-url`— libSQL URL (`:memory:` or `file:///path/to.db`)
+Artifacts and checksums will be in `target/publish/`.
+
+---
+
+## Running
+
+```sh
+./target/release/loggy --port 8080 --db-url ./loggy.db
+```
+
+- `--port` (default: 8080): HTTP port to listen on
+- `--db-url` (default: :memory:): Path to libSQL database file, or `:memory:` for in-memory
+
+---
+
+## MCP Integration with Cursor
+
+Loggy implements the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) and can be used as a local MCP server for Cursor and other LLM tools.
+
+### 1. Add an `mcp.json` to your project root:
+
+```
+{
+  "name": "Loggy Local Logs",
+  "description": "Local log search and ingestion via Loggy MCP server",
+  "endpoint": "http://localhost:8080/mcp/sse",
+  "transport": "sse",
+  "capabilities": ["tools", "logging", "resources", "prompts"],
+  "version": "2025-03-26"
+}
+```
+
+- `endpoint` should match the port you run loggy on
+- `transport` must be `sse`
+- `version` should match the protocol version supported by loggy
+
+### 2. Start Loggy
+
+```sh
+./target/release/loggy --port 8080 --db-url ./loggy.db
+```
+
+### 3. In Cursor
+
+- Open the Command Palette and search for "Connect MCP Server"
+- Select your `mcp.json` file
+- You should see Loggy's tools (list_services, search_logs, get_log) available in the Cursor UI
+
+---
+
+## Example: Ingesting Logs
+
+### NDJSON
+
+```sh
+curl -X POST --data-binary @logs.ndjson \
+     -H 'Content-Type: application/x-ndjson' \
+     http://localhost:8080/logs/ndjson
+```
+
+### OTLP (OpenTelemetry Logs)
+
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     --data @otlp.json \
+     http://localhost:8080/v1/logs
+```
+
+---
+
+## License
+
+MIT
 
 API Endpoints
 -------------
@@ -111,38 +178,6 @@ loggy_failed_ingestions_total 4
 # HELP loggy_db_size_bytes Current size of the DB file in bytes
 # TYPE loggy_db_size_bytes gauge
 loggy_db_size_bytes 1048576
-```
-
-Examples
---------
-
-###### NDJSON Ingestion
-
-```bash
-curl -X POST http://localhost:8080/logs/ndjson \
-     -H "Content-Type: application/x-ndjson" \
-     --data-binary $'
-{"timestamp":"2025-05-19T12:00:00Z","level":"INFO","service":"auth","message":"User login successful"}\n'
-```
-
-###### OTLP Ingestion
-
-```bash
-curl -X POST http://localhost:8080/v1/logs \
-     -H "Content-Type: application/json" \
-     -d '@payload_otlp.json'
-```
-
-###### MCP JSON-RPC (search_logs)
-
-```bash
-# In one terminal: listen for SSE
-curl -N http://localhost:8080/mcp/sse
-
-# In another terminal: send a JSON-RPC request
-curl -X POST http://localhost:8080/mcp/sse \
-     -H "Content-Type: application/json" \
-     -d '{"jsonrpc":"2.0","id":1,"method":"search_logs","params":{"q":"error"}}'
 ```
 
 Configuration & Environment
