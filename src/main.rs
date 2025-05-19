@@ -5,7 +5,7 @@ use libsql::{Builder, Connection};
 use clap::Parser;
 use hostname::get as get_hostname;
 use std::process;
-use tracing::{info, error, debug};
+use tracing::{info, error};
 use tracing_subscriber;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -275,9 +275,16 @@ struct JsonRpcRequest {
 
 /// SSE endpoint: establish connection and receive server messages
 async fn mcp_sse(data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    // Log SSE connection attempt
+    let conn_info = req.connection_info();
+    let remote = conn_info.realip_remote_addr().unwrap_or("<unknown>");
+    let origin_opt = req.headers().get("Origin").and_then(|h| h.to_str().ok());
+    info!("MCP[SSE] connection attempt from {} with Origin {:?}", remote, origin_opt);
     if req.headers().get("Origin").is_none() {
+        error!("MCP[SSE] connection rejected: missing Origin header from {}", remote);
         return HttpResponse::Forbidden().body("Missing Origin");
     }
+    info!("MCP[SSE] connection established from {}", remote);
     let mut rx = data.broadcaster.subscribe();
     let init = tokio_stream::iter(vec![
         Ok::<Bytes, actix_web::Error>(Bytes::from_static(b"event: endpoint\ndata: /mcp/sse\n\n")),
@@ -300,14 +307,18 @@ async fn mcp_sse(data: web::Data<AppState>, req: HttpRequest) -> impl Responder 
 
 /// POST endpoint: receive client messages
 async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
+    // Log incoming JSON-RPC POST
+    info!("MCP[POST] raw body: {}", body);
     let req: JsonRpcRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
-        Err(_) => return HttpResponse::BadRequest().body("Invalid JSON-RPC"),
+        Err(e) => { error!("MCP[POST] JSON parse error: {} -- body: {}", e, body); return HttpResponse::BadRequest().body("Invalid JSON-RPC"); }
     };
+    // Log parsed JSON-RPC request
+    info!("MCP[POST] JSON-RPC request: method={}, id={:?}, params={:?}", req.method, req.id, req.params);
     if req.method == "initialized" && req.id.is_none() {
         // notification; nothing to do
     } else if let Some(id) = req.id.clone() {
-        let mut response = json!({"jsonrpc": "2.0", "id": id});
+        let mut response = json!({"jsonrpc": "2.0", "id": id.clone()});
         match req.method.as_str() {
             "initialize" => {
                 response["result"] = json!({
@@ -332,7 +343,11 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                 response["error"] = json!({"code": -32601, "message": "Method not found"});
             }
         }
-        let _ = data.broadcaster.send(response.to_string());
+        // Broadcast JSON-RPC response over SSE
+        match data.broadcaster.send(response.to_string()) {
+            Ok(subs) => info!("MCP broadcasted response id {:?} to {} subscribers", id, subs),
+            Err(e) => error!("MCP broadcast error for id {:?}: {:?}", id, e),
+        }
     }
     HttpResponse::Ok().finish()
 }
