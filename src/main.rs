@@ -322,7 +322,7 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
     };
     // Log parsed JSON-RPC request
     info!("MCP[POST] JSON-RPC request: method={}, id={:?}, params={:?}", req.method, req.id, req.params);
-    if req.method == "initialized" && req.id.is_none() {
+    if req.method == "notifications/initialized" && req.id.is_none() {
         // notification; nothing to do
     } else if let Some(id) = req.id.clone() {
         let mut response = json!({"jsonrpc": "2.0", "id": id.clone()});
@@ -335,13 +335,107 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                     "instructions": ""
                 });
             }
-            "list_tools" => {
-                let tools = vec![json!({"name": "list_services"}), json!({"name": "search_logs"}), json!({"name": "get_log"})];
+            "tools/list" => {
+                let tools = vec![
+                    json!({
+                        "name": "list_services",
+                        "description": "List all service names that have logged entries",
+                        "inputSchema": { "type": "object", "properties": {}, "required": [] },
+                        "annotations": {"title": "List Services", "readOnlyHint": true, "openWorldHint": false}
+                    }),
+                    json!({
+                        "name": "search_logs",
+                        "description": "Search logs by full-text message content",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "q": {"type": "string", "description": "Search query text"},
+                                "limit": {"type": "integer", "description": "Maximum results to return"},
+                                "offset": {"type": "integer", "description": "Number of results to skip"}
+                            },
+                            "required": ["q"]
+                        },
+                        "annotations": {"title": "Search Logs", "readOnlyHint": true, "openWorldHint": false}
+                    }),
+                    json!({
+                        "name": "get_log",
+                        "description": "Retrieve a single log entry by ID",
+                        "inputSchema": {
+                            "type": "object", 
+                            "properties": {"id": {"type": "integer", "description": "Log entry ID"}}, 
+                            "required": ["id"]
+                        },
+                        "annotations": {"title": "Get Log", "readOnlyHint": true, "openWorldHint": false}
+                    })
+                ];
                 response["result"] = json!({"tools": tools});
             }
-            "call_tool" => {
-                if let Some(params) = req.params {
-                    response["result"] = params;
+            "tools/call" => {
+                if let Some(params) = &req.params {
+                    // Extract tool name and arguments
+                    let tool_name = params.get("name").and_then(Value::as_str);
+                    let args = params.get("arguments");
+                    
+                    if let Some(name) = tool_name {
+                        match name {
+                            "list_services" => {
+                                // Fetch distinct service names from the database
+                                match list_distinct_services(&data.conn).await {
+                                    Ok(services) => {
+                                        let text = format!("Available services: {}", services.join(", "));
+                                        response["result"] = json!({"content": [{"type": "text", "text": text}]});
+                                    },
+                                    Err(e) => {
+                                        error!("Error listing services: {:?}", e);
+                                        response["error"] = json!({"code": -32603, "message": "Database error"});
+                                    }
+                                }
+                            },
+                            "search_logs" => {
+                                if let Some(args_obj) = args {
+                                    let q = args_obj.get("q").and_then(Value::as_str).unwrap_or("");
+                                    let limit = args_obj.get("limit").and_then(Value::as_u64).unwrap_or(10);
+                                    let offset = args_obj.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                                    
+                                    match search_logs(&data.conn, q, limit as i64, offset as i64).await {
+                                        Ok(results) => {
+                                            response["result"] = json!({"content": [{"type": "text", "text": results}]});
+                                        },
+                                        Err(e) => {
+                                            error!("Error searching logs: {:?}", e);
+                                            response["error"] = json!({"code": -32603, "message": "Database error"});
+                                        }
+                                    }
+                                } else {
+                                    response["error"] = json!({"code": -32602, "message": "Missing search query"});
+                                }
+                            },
+                            "get_log" => {
+                                if let Some(args_obj) = args {
+                                    if let Some(id) = args_obj.get("id").and_then(Value::as_u64) {
+                                        match get_log_by_id(&data.conn, id as i64).await {
+                                            Ok(log_entry) => {
+                                                response["result"] = json!({"content": [{"type": "text", "text": log_entry}]});
+                                            },
+                                            Err(e) => {
+                                                error!("Error getting log: {:?}", e);
+                                                response["error"] = json!({"code": -32603, "message": "Database error"});
+                                            }
+                                        }
+                                    } else {
+                                        response["error"] = json!({"code": -32602, "message": "Missing or invalid 'id' parameter"});
+                                    }
+                                } else {
+                                    response["error"] = json!({"code": -32602, "message": "Missing arguments"});
+                                }
+                            },
+                            _ => {
+                                response["error"] = json!({"code": -32601, "message": format!("Tool not found: {}", name)});
+                            }
+                        }
+                    } else {
+                        response["error"] = json!({"code": -32602, "message": "Missing tool name"});
+                    }
                 } else {
                     response["error"] = json!({"code": -32602, "message": "Missing params"});
                 }
@@ -357,6 +451,52 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
         }
     }
     HttpResponse::Ok().finish()
+}
+
+// Helper functions for tool implementation
+async fn list_distinct_services(conn: &Connection) -> Result<Vec<String>, libsql::Error> {
+    let mut rows = conn.query("SELECT DISTINCT service FROM logs ORDER BY service", ()).await?;
+    let mut services = Vec::new();
+    
+    while let Some(row) = rows.next().await? {
+        if let Ok(service) = row.get::<String>(0) {
+            services.push(service);
+        }
+    }
+    
+    Ok(services)
+}
+
+async fn search_logs(conn: &Connection, query: &str, limit: i64, offset: i64) -> Result<String, libsql::Error> {
+    let pattern = format!("%{}%", query);
+    let sql = "SELECT json_group_array(json_object('id', id, 'ts', ts, 'level', level, 'service', service, 'body', body)) 
+               FROM logs 
+               WHERE json_extract(body, '$.message') LIKE ?1 
+               LIMIT ?2 OFFSET ?3";
+    
+    let mut rows = conn.query(sql, libsql::params![pattern, limit, offset]).await?;
+    
+    if let Some(row) = rows.next().await? {
+        let json_text: String = row.get(0)?;
+        Ok(json_text)
+    } else {
+        Ok("[]".to_string())
+    }
+}
+
+async fn get_log_by_id(conn: &Connection, id: i64) -> Result<String, libsql::Error> {
+    let sql = "SELECT json_object('id', id, 'ts', ts, 'level', level, 'service', service, 'body', body) 
+               FROM logs 
+               WHERE id = ?1";
+    
+    let mut rows = conn.query(sql, libsql::params![id]).await?;
+    
+    if let Some(row) = rows.next().await? {
+        let json_text: String = row.get(0)?;
+        Ok(json_text)
+    } else {
+        Ok("{}".to_string())
+    }
 }
 
 #[actix_web::main]
