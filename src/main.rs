@@ -280,7 +280,14 @@ async fn mcp_sse(data: web::Data<AppState>, req: HttpRequest) -> impl Responder 
     let remote = conn_info.realip_remote_addr().unwrap_or("<unknown>");
     let origin_opt = req.headers().get("Origin").and_then(|h| h.to_str().ok());
     info!("MCP[SSE] connection attempt from {} with Origin {:?}", remote, origin_opt);
-    if req.headers().get("Origin").is_none() {
+    
+    // Check if this is a localhost connection - allow without Origin in dev
+    let is_localhost = remote.starts_with("127.0.0.1") || 
+                       remote.starts_with("::1") || 
+                       remote.starts_with("localhost");
+                       
+    // Either require Origin header or allow if it's a localhost connection
+    if req.headers().get("Origin").is_none() && !is_localhost {
         error!("MCP[SSE] connection rejected: missing Origin header from {}", remote);
         return HttpResponse::Forbidden().body("Missing Origin");
     }
