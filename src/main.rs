@@ -637,7 +637,7 @@ async fn fetch_service_logs_text(conn: &Connection, service: &str) -> Result<Str
     Ok(buf)
 }
 
-/// Admin UI: display log count, db size, and clear logs button
+/// Admin UI: display log count, db size, health, and metrics
 async fn admin_ui(data: web::Data<AppState>) -> impl Responder {
     // count logs
     let count: i64 = match data.conn.query("SELECT COUNT(*) FROM logs", ()).await {
@@ -654,6 +654,11 @@ async fn admin_ui(data: web::Data<AppState>) -> impl Responder {
     } else {
         fs::metadata(&data.db_url).map(|m| m.len()).unwrap_or(0)
     };
+    // health status
+    let health_status = if data.conn.execute("SELECT 1", ()).await.is_ok() { "OK" } else { "DB unreachable" };
+    // metrics totals
+    let ingested_total = LOGS_INGESTED.load(Ordering::SeqCst);
+    let failed_total = INGESTION_FAILURES.load(Ordering::SeqCst);
     // render html
     let html = format!(r#"<!doctype html>
 <html lang="en">
@@ -665,13 +670,25 @@ async fn admin_ui(data: web::Data<AppState>) -> impl Responder {
   </head>
   <body class="container py-5">
     <h1>Loggy Admin Interface</h1>
+    <p>Health: <strong>{health_status}</strong></p>
     <p>Number of logs: <strong>{count}</strong></p>
-    <p>Database size: <strong>{db_size} bytes</strong></p>
+    <p>Metrics:</p>
+    <ul>
+      <li>Ingested total: {ingested_total}</li>
+      <li>Failed ingestions: {failed_total}</li>
+      <li>Database size: {db_size} bytes</li>
+    </ul>
     <form method="post" action="/admin/clear">
       <button type="submit" class="btn btn-danger">Clear Logs</button>
     </form>
   </body>
-</html>"#, count=count, db_size=db_size);
+</html>"#,
+        health_status=health_status,
+        count=count,
+        ingested_total=ingested_total,
+        failed_total=failed_total,
+        db_size=db_size
+    );
     HttpResponse::Ok().content_type("text/html; charset=utf-8").body(html)
 }
 
