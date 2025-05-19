@@ -330,7 +330,9 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
     info!("MCP[POST] JSON-RPC request: method={}, id={:?}, params={:?}", req.method, req.id, req.params);
     if req.method == "notifications/initialized" && req.id.is_none() {
         // notification; nothing to do
-    } else if let Some(id) = req.id.clone() {
+        return HttpResponse::Ok().finish();
+    }
+    if let Some(id) = req.id.clone() {
         let mut response = json!({"jsonrpc": "2.0", "id": id.clone()});
         match req.method.as_str() {
             "initialize" => {
@@ -450,11 +452,8 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                 response["error"] = json!({"code": -32601, "message": "Method not found"});
             }
         }
-        // Broadcast JSON-RPC response over SSE
-        match data.broadcaster.send(response.to_string()) {
-            Ok(subs) => info!("MCP broadcasted response id {:?} to {} subscribers", id, subs),
-            Err(e) => error!("MCP broadcast error for id {:?}: {:?}", id, e),
-        }
+        // Respond synchronously with JSON-RPC response
+        return HttpResponse::Ok().json(response);
     }
     HttpResponse::Ok().finish()
 }
