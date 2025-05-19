@@ -59,6 +59,7 @@ struct AppState {
     conn: Connection,
     db_url: String,
     broadcaster: Sender<String>,
+    port: u16,
 }
 
 async fn ingest_ndjson(
@@ -338,7 +339,12 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
             "initialize" => {
                 response["result"] = json!({
                     "protocolVersion": "2025-03-26",
-                    "capabilities": {"tools": {"listChanged": false}, "logging": {}, "resources": {}, "prompts": {}},
+                    "capabilities": {
+                        "tools": {"listChanged": false},
+                        "logging": {},
+                        "resources": {"subscribe": true, "listChanged": true},
+                        "prompts": {}
+                    },
                     "serverInfo": {"name": "loggy", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": ""
                 });
@@ -374,7 +380,31 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                             "required": ["id"]
                         },
                         "annotations": {"title": "Get Log", "readOnlyHint": true, "openWorldHint": false}
-                    })
+                    }),
+                    json!({
+                        "name": "tail_logs",
+                        "description": "Stream the last N lines (optionally filtered by service & level)",
+                        "inputSchema": {"type": "object", "properties": {"service": {"type": "string"}, "level": {"type": "string"}, "lines": {"type": "integer"}}, "required": []},
+                        "annotations": {"title": "Tail Logs", "readOnlyHint": true, "idempotentHint": false}
+                    }),
+                    json!({
+                        "name": "search_logs_around",
+                        "description": "Fetch log entries before & after a given ID",
+                        "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "before": {"type": "integer"}, "after": {"type": "integer"}}, "required": ["id"]},
+                        "annotations": {"title": "Search Logs Around", "readOnlyHint": true}
+                    }),
+                    json!({
+                        "name": "summarize_logs",
+                        "description": "Natural-language summary of logs over a time window",
+                        "inputSchema": {"type": "object", "properties": {"service": {"type": "string"}, "level": {"type": "string"}, "minutes": {"type": "integer"}}, "required": ["minutes"]},
+                        "annotations": {"title": "Summarize Logs", "readOnlyHint": true}
+                    }),
+                    json!({
+                        "name": "get_metrics",
+                        "description": "Fetch current ingestion and DB metrics",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                        "annotations": {"title": "Get Metrics", "readOnlyHint": true}
+                    }),
                 ];
                 response["result"] = json!({"tools": tools});
             }
@@ -448,6 +478,79 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                     response["error"] = json!({"code": -32602, "message": "Missing params"});
                 }
             }
+            "resources/list" => {
+                let mut resources = Vec::new();
+                // all logs snapshot
+                resources.push(json!({"uri": "file:///loggy/logs/all.log","name": "all.log","description": "All logs","mimeType": "text/plain"}));
+                // per-service logs
+                if let Ok(services) = list_distinct_services(&data.conn).await {
+                    for svc in services {
+                        resources.push(json!({
+                            "uri": format!("file:///loggy/logs/{}.log", svc),
+                            "name": format!("{}.log", svc),
+                            "description": format!("Log snapshot for {}", svc),
+                            "mimeType": "text/plain"
+                        }));
+                    }
+                }
+                // configuration
+                resources.push(json!({"uri": "file:///loggy/config.toml","name": "config.toml","description": "Loggy configuration","mimeType": "text/plain"}));
+                // metrics snapshot
+                resources.push(json!({"uri": "file:///loggy/metrics.txt","name": "metrics.txt","description": "Metrics snapshot","mimeType": "text/plain"}));
+                response["result"] = json!({"resources": resources});
+            }
+            "resources/read" => {
+                if let Some(p) = &req.params {
+                    if let Some(uri) = p.get("uri").and_then(Value::as_str) {
+                        let mut content = json!({"uri": uri, "mimeType": "text/plain", "text": ""});
+                        if uri.ends_with("all.log") {
+                            if let Ok(text) = fetch_all_logs_text(&data.conn).await {
+                                content["text"] = json!(text);
+                            }
+                        } else if uri.contains("/logs/") && uri.ends_with(".log") {
+                            let svc = uri.trim_start_matches("file:///loggy/logs/").trim_end_matches(".log");
+                            if let Ok(text) = fetch_service_logs_text(&data.conn, svc).await {
+                                content["text"] = json!(text);
+                            }
+                        } else if uri.ends_with("config.toml") {
+                            let toml = format!("port = {}\ndb_url = \"{}\"\n", data.port, data.db_url);
+                            content["text"] = json!(toml);
+                        } else if uri.ends_with("metrics.txt") {
+                            let ing = LOGS_INGESTED.load(Ordering::SeqCst);
+                            let f = INGESTION_FAILURES.load(Ordering::SeqCst);
+                            let db_sz = if data.db_url == ":memory:" { 0 } else { fs::metadata(&data.db_url).map(|m| m.len()).unwrap_or(0) };
+                            let body = format!("# HELP loggy_ingested_total...\nloggy_ingested_total {ingested}\n# HELP loggy_failed_ingestions_total...\nloggy_failed_ingestions_total {failed}\n# HELP loggy_db_size_bytes...\nloggy_db_size_bytes {db_size}\n", ingested=ing, failed=f, db_size=db_sz);
+                            content["text"] = json!(body);
+                        }
+                        response["result"] = json!({"contents": [content]});
+                    } else {
+                        response["error"] = json!({"code": -32602, "message": "Missing uri param"});
+                    }
+                } else {
+                    response["error"] = json!({"code": -32602, "message": "Missing params"});
+                }
+            }
+            "resources/templates/list" => {
+                let templates = vec![
+                    json!({"uriTemplate": "logquery:///{service}/{level}/{startTs}/{endTs}", "name": "Time Range Logs", "description": "Select logs for a given service & level between two ISO-8601 timestamps", "mimeType": "application/json"}),
+                    json!({"uriTemplate": "logentry:///{id}?before={n}&after={m}", "name": "Entry Drilldown", "description": "Fetch N entries before and M entries after a log ID", "mimeType": "application/json"}),
+                    json!({"uriTemplate": "file:///project/src/{path}", "name": "Source Code Files", "description": "Fetch source code snippets by path", "mimeType": "text/x-rust"}),
+                ];
+                response["result"] = json!({"resourceTemplates": templates});
+            }
+            "resources/subscribe" => {
+                if let Some(p) = &req.params {
+                    if let Some(uri) = p.get("uri").and_then(Value::as_str) {
+                        response["result"] = json!({});
+                        let notif = json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": uri}});
+                        let _ = data.broadcaster.send(notif.to_string());
+                    } else {
+                        response["error"] = json!({"code": -32602, "message": "Missing uri param"});
+                    }
+                } else {
+                    response["error"] = json!({"code": -32602, "message": "Missing params"});
+                }
+            }
             _ => {
                 response["error"] = json!({"code": -32601, "message": "Method not found"});
             }
@@ -504,13 +607,43 @@ async fn get_log_by_id(conn: &Connection, id: i64) -> Result<String, libsql::Err
     }
 }
 
+// Helper to read all logs as plain text
+async fn fetch_all_logs_text(conn: &Connection) -> Result<String, libsql::Error> {
+    let mut rows = conn.query(
+        "SELECT ts || ' [' || level || '] ' || json_extract(body, '$.message') as line FROM logs ORDER BY id", 
+        ()
+    ).await?;
+    let mut buf = String::new();
+    while let Some(row) = rows.next().await? {
+        let line: String = row.get(0)?;
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    Ok(buf)
+}
+
+// Helper to read logs for one service as plain text
+async fn fetch_service_logs_text(conn: &Connection, service: &str) -> Result<String, libsql::Error> {
+    let mut rows = conn.query(
+        "SELECT ts || ' [' || level || '] ' || json_extract(body, '$.message') as line FROM logs WHERE service = ?1 ORDER BY id",
+        libsql::params![service]
+    ).await?;
+    let mut buf = String::new();
+    while let Some(row) = rows.next().await? {
+        let line: String = row.get(0)?;
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    Ok(buf)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let config = Config::parse();
     tracing_subscriber::fmt::init();
     let conn = init_db(&config.db_url).await;
     let (broadcaster_tx, _) = channel(100);
-    let state = web::Data::new(AppState { conn, db_url: config.db_url.clone(), broadcaster: broadcaster_tx.clone() });
+    let state = web::Data::new(AppState { conn, db_url: config.db_url.clone(), broadcaster: broadcaster_tx.clone(), port: config.port });
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
