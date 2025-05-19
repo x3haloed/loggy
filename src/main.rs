@@ -485,6 +485,24 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                                     response["error"] = json!({"code": -32602, "message": "Missing arguments"});
                                 }
                             },
+                            "tail_logs" => {
+                                if let Some(args_obj) = args {
+                                    let lines_n = args_obj.get("lines").and_then(Value::as_u64).unwrap_or(10) as i64;
+                                    let service_opt = args_obj.get("service").and_then(Value::as_str);
+                                    let level_opt = args_obj.get("level").and_then(Value::as_str);
+                                    match tail_logs(&data.conn, service_opt, level_opt, lines_n).await {
+                                        Ok(text) => {
+                                            response["result"] = json!({"content": [{"type": "text", "text": text}]});
+                                        },
+                                        Err(e) => {
+                                            error!("Error tailing logs: {:?}", e);
+                                            response["error"] = json!({"code": -32603, "message": "Database error"});
+                                        }
+                                    }
+                                } else {
+                                    response["error"] = json!({"code": -32602, "message": "Missing arguments"});
+                                }
+                            },
                             _ => {
                                 response["error"] = json!({"code": -32601, "message": format!("Tool not found: {}", name)});
                             }
@@ -653,6 +671,15 @@ async fn fetch_service_logs_text(conn: &Connection, service: &str) -> Result<Str
         buf.push('\n');
     }
     Ok(buf)
+}
+
+// Add helper function for tail_logs
+async fn tail_logs(conn: &Connection, _service: Option<&str>, _level: Option<&str>, lines: i64) -> Result<String, libsql::Error> {
+    let all_text = fetch_all_logs_text(conn).await?;
+    let lines_vec: Vec<&str> = all_text.lines().collect();
+    let start = if (lines as usize) < lines_vec.len() { lines_vec.len() - lines as usize } else { 0 };
+    let selected = &lines_vec[start..];
+    Ok(selected.join("\n"))
 }
 
 /// Admin UI: display log count, db size, health, and metrics
