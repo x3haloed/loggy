@@ -10,6 +10,9 @@ use tracing_subscriber;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs;
+use tokio_stream::StreamExt;
+use libsql::Row;
+use serde::Serialize;
 
 // Metrics counters
 static LOGS_INGESTED: AtomicU64 = AtomicU64::new(0);
@@ -259,6 +262,110 @@ loggy_db_size_bytes {db_size}\n",
         .body(body)
 }
 
+#[derive(Deserialize)]
+struct CallToolRequest {
+    name: String,
+    arguments: Option<Value>,
+}
+
+/// MCP endpoint: list available tools
+async fn list_tools() -> impl Responder {
+    let tools = vec![
+        json!({
+            "name": "list_services",
+            "description": "List distinct service names",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] },
+            "annotations": {"title": "List Services", "readOnlyHint": true, "openWorldHint": false}
+        }),
+        json!({
+            "name": "search_logs",
+            "description": "Search logs by full-text message",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "offset": {"type": "integer"}
+                },
+                "required": ["q"]
+            },
+            "annotations": {"title": "Search Logs", "readOnlyHint": true, "openWorldHint": false}
+        }),
+        json!({
+            "name": "get_log",
+            "description": "Retrieve a single log by ID",
+            "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+            "annotations": {"title": "Get Log", "readOnlyHint": true, "openWorldHint": false}
+        })
+    ];
+    HttpResponse::Ok().json(json!({"tools": tools}))
+}
+
+/// MCP endpoint: call a tool by name
+async fn call_tool(
+    req: web::Json<CallToolRequest>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let name = req.name.as_str();
+    match name {
+        "list_services" => {
+            // build JSON array of services
+            let sql = "SELECT json_group_array(service) FROM (SELECT DISTINCT service FROM logs)";
+            let mut rows = data.conn.query(sql, libsql::params![]).await.unwrap();
+            if let Some(row) = rows.next().await.unwrap() {
+                let arr: String = row.get(0).unwrap();
+                let text = arr;
+                HttpResponse::Ok().json(json!({"content": [{"type": "text", "text": text}]}))
+            } else {
+                HttpResponse::Ok().json(json!({"content": [{"type": "text", "text": "[]"}]}))
+            }
+        }
+        "search_logs" => {
+            let args = if let Some(a) = &req.arguments {
+                a
+            } else {
+                return HttpResponse::BadRequest().json(json!({"isError": true, "content": [{"type": "text", "text": "Missing arguments for search_logs"}]}));
+            };
+            let q = args.get("q").and_then(Value::as_str).unwrap_or("");
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10);
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            let pattern = format!("%{}%", q);
+            // search JSON message field
+            let sql = "SELECT json_group_array(json_object('id', id, 'ts', ts, 'level', level, 'service', service, 'body', body)) FROM logs WHERE json_extract(body, '$.message') LIKE ?1 LIMIT ?2 OFFSET ?3";
+            let mut rows = data.conn.query(sql, libsql::params![pattern, limit as i64, offset as i64]).await.unwrap();
+            if let Some(row) = rows.next().await.unwrap() {
+                let arr: String = row.get(0).unwrap();
+                let text = arr;
+                HttpResponse::Ok().json(json!({"content": [{"type": "text", "text": text}]}))
+            } else {
+                HttpResponse::Ok().json(json!({"content": [{"type": "text", "text": "[]"}]}))
+            }
+        }
+        "get_log" => {
+            let args = if let Some(a) = &req.arguments {
+                a
+            } else {
+                return HttpResponse::BadRequest().json(json!({"isError": true, "content": [{"type": "text", "text": "Missing arguments for get_log"}]}));
+            };
+            let id = args.get("id").and_then(Value::as_u64);
+            if let Some(id) = id {
+                let sql = "SELECT json_object('id', id, 'ts', ts, 'level', level, 'service', service, 'body', body) FROM logs WHERE id = ?1";
+                let mut rows = data.conn.query(sql, libsql::params![id as i64]).await.unwrap();
+                if let Some(row) = rows.next().await.unwrap() {
+                    let obj: String = row.get(0).unwrap();
+                    let text = obj;
+                    HttpResponse::Ok().json(json!({"content": [{"type": "text", "text": text}]}))
+                } else {
+                    HttpResponse::Ok().json(json!({"content": [{"type": "text", "text": "{}"}]}))
+                }
+            } else {
+                HttpResponse::BadRequest().json(json!({"isError": true, "content": [{"type": "text", "text": "Missing 'id' argument"}]}))
+            }
+        }
+        _ => HttpResponse::BadRequest().json(json!({"isError": true, "content": [{"type": "text", "text": format!("Tool not found: {}", name)}]})),
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let config = Config::parse();
@@ -270,6 +377,8 @@ async fn main() -> std::io::Result<()> {
             .app_data(state.clone())
             .route("/logs/ndjson", web::post().to(ingest_ndjson))
             .route("/v1/logs", web::post().to(ingest_otlp))
+            .route("/tools/list", web::post().to(list_tools))
+            .route("/tools/call", web::post().to(call_tool))
             .route("/healthz", web::get().to(health))
             .route("/metrics", web::get().to(metrics))
     })

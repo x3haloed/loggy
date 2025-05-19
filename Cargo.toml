@@ -14,3 +14,4 @@ clap = { version = "4", features = ["derive"] }
 hostname = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tokio-stream = "0.1"
