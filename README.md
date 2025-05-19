@@ -102,6 +102,47 @@ curl -X POST -H 'Content-Type: application/json' \
      http://localhost:8080/v1/logs
 ```
 
+#### C# (OpenTelemetry OTLP exporter)
+
+Add the following NuGet packages:
+
+```sh
+dotnet add package OpenTelemetry
+dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
+```
+
+Then configure your logging in `Program.cs`:
+
+```csharp
+using Microsoft.Extensions.Logging;
+using OpenTelemetry;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Resources;
+
+var loggerFactory = LoggerFactory.Create(builder =>
+{
+    builder.ClearProviders();
+    builder.AddOpenTelemetry(options =>
+    {
+        // Identify your service
+        options.SetResourceBuilder(
+            ResourceBuilder.CreateDefault()
+                .AddService("MyService"));
+        // Include formatted messages and state values
+        options.IncludeFormattedMessage = true;
+        options.ParseStateValues = true;
+        // Export to Loggy's OTLP endpoint
+        options.AddOtlpExporter(otlp =>
+        {
+            otlp.Endpoint = new Uri("http://localhost:8080/v1/logs");
+        });
+    });
+});
+
+var logger = loggerFactory.CreateLogger<Program>();
+logger.LogInformation("User {User} logged in", userId);
+```
+
 ---
 
 ## License
