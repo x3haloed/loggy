@@ -17,6 +17,10 @@ use tokio::sync::broadcast::{channel, Sender};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::IntervalStream;
 use std::time::Duration;
+use prost::Message;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest as ProtoExportLogsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue as ProtoAnyValue, KeyValue as ProtoKeyValue};
+use opentelemetry_proto::tonic::common::v1::any_value::Value as ProtoAnyValueKind;
 
 // Metrics counters
 static LOGS_INGESTED: AtomicU64 = AtomicU64::new(0);
@@ -165,64 +169,78 @@ struct AnyValue {
 }
 
 async fn ingest_otlp(
-    req: web::Json<ExportLogsServiceRequest>,
+    req: HttpRequest,
+    body: Bytes,
     data: web::Data<AppState>,
 ) -> impl Responder {
     let hostname = get_hostname().unwrap_or_default().to_string_lossy().to_string();
     let pid = process::id();
     let tx = data.conn.transaction().await.unwrap();
     let mut count = 0;
-    for resource in &req.resource_logs {
-        for ils in &resource.instrumentation_library_logs {
-            for log in &ils.logs {
-                let ts_nano: u128 = log.time_unix_nano.parse().unwrap_or_default();
-                let secs = (ts_nano / 1_000_000_000) as i64;
-                let nsecs = (ts_nano % 1_000_000_000) as u32;
-                let naive = NaiveDateTime::from_timestamp_opt(secs, nsecs)
-                    .unwrap_or_else(|| NaiveDateTime::from_timestamp(0, 0));
-                let datetime: DateTime<Utc> = DateTime::from_utc(naive, Utc);
-                let ts = datetime.to_rfc3339();
-                let level = log.severity_text.clone();
-                let mut service = "unknown".to_string();
-                for kv in &log.attributes {
-                    if kv.key == "service.name" {
-                        if let Some(ref s) = kv.value.string_value {
-                            service = s.clone();
+    // dispatch based on Content-Type
+    let ct = req.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("");
+    if ct.starts_with("application/x-protobuf") {
+        // Protobuf payload
+        let proto_req = match ProtoExportLogsServiceRequest::decode(&*body) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Protobuf decode error ingest_otlp: {:?}", e);
+                INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
+                return HttpResponse::BadRequest().json(json!({"error": "Protobuf decode error"}));
+            }
+        };
+        for resource in proto_req.resource_logs {
+            for scope in resource.scope_logs {
+                for log in scope.log_records {
+                    let ts_nano: u128 = log.time_unix_nano as u128;
+                    let secs = (ts_nano / 1_000_000_000) as i64;
+                    let nsecs = (ts_nano % 1_000_000_000) as u32;
+                    let naive = NaiveDateTime::from_timestamp_opt(secs, nsecs)
+                        .unwrap_or_else(|| NaiveDateTime::from_timestamp(0, 0));
+                    let datetime: DateTime<Utc> = DateTime::from_utc(naive, Utc);
+                    let ts = datetime.to_rfc3339();
+                    let level = log.severity_text.clone();
+                    let mut service = "unknown".to_string();
+                    for kv in &log.attributes {
+                        if kv.key == "service.name" {
+                            if let Some(ProtoAnyValue { value: Some(ProtoAnyValueKind::StringValue(s)) }) = &kv.value {
+                                service = s.clone();
+                            }
                         }
                     }
+                    let mut map = serde_json::Map::new();
+                    for kv in &log.attributes {
+                        let val = match &kv.value {
+                            Some(ProtoAnyValue { value: Some(ProtoAnyValueKind::StringValue(s)) }) => Value::String(s.clone()),
+                            Some(ProtoAnyValue { value: Some(ProtoAnyValueKind::BoolValue(b)) }) => Value::Bool(*b),
+                            Some(ProtoAnyValue { value: Some(ProtoAnyValueKind::IntValue(i)) }) => Value::Number((*i).into()),
+                            Some(ProtoAnyValue { value: Some(ProtoAnyValueKind::DoubleValue(d)) }) => serde_json::Number::from_f64(*d).map(Value::Number).unwrap_or(Value::Null),
+                            _ => Value::Null,
+                        };
+                        map.insert(kv.key.clone(), val);
+                    }
+                    if let Some(ProtoAnyValue { value: Some(ProtoAnyValueKind::StringValue(msg)) }) = &log.body {
+                        map.insert("message".to_string(), Value::String(msg.clone()));
+                    }
+                    map.insert("host_name".to_string(), Value::String(hostname.clone()));
+                    map.insert("process_id".to_string(), Value::Number(pid.into()));
+                    let body_str = Value::Object(map).to_string();
+                    if let Err(e) = tx.execute(
+                        "INSERT INTO logs (ts, level, service, body) VALUES (?1, ?2, ?3, ?4)",
+                        (ts, level.clone(), service.clone(), body_str),
+                    ).await {
+                        error!("OTLP DB insert error: {:?}", e);
+                        INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
+                        return HttpResponse::InternalServerError().json(json!({"error": "Database insert error"}));
+                    }
+                    count += 1;
                 }
-                let mut map = serde_json::Map::new();
-                for kv in &log.attributes {
-                    let val = if let Some(ref s) = kv.value.string_value {
-                        Value::String(s.clone())
-                    } else if let Some(b) = kv.value.bool_value {
-                        Value::Bool(b)
-                    } else if let Some(i) = kv.value.int_value {
-                        Value::Number(i.into())
-                    } else if let Some(d) = kv.value.double_value {
-                        serde_json::Number::from_f64(d).map(Value::Number).unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    };
-                    map.insert(kv.key.clone(), val);
-                }
-                if let Some(ref msg) = log.body.string_value {
-                    map.insert("message".to_string(), Value::String(msg.clone()));
-                }
-                map.insert("host_name".to_string(), Value::String(hostname.clone()));
-                map.insert("process_id".to_string(), Value::Number(pid.into()));
-                let body_str = Value::Object(map).to_string();
-                if let Err(e) = tx.execute(
-                    "INSERT INTO logs (ts, level, service, body) VALUES (?1, ?2, ?3, ?4)",
-                    (ts, level, service.clone(), body_str),
-                ).await {
-                    error!("OTLP DB insert error: {:?}", e);
-                    INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
-                    return HttpResponse::InternalServerError().json(json!({"error": "Database insert error"}));
-                }
-                count += 1;
             }
         }
+    } else {
+        error!("OTLP parse error: invalid protobuf payload");
+        INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
+        return HttpResponse::BadRequest().json(json!({"error": "Invalid OTLP protobuf payload"}));
     }
     tx.commit().await.unwrap();
     LOGS_INGESTED.fetch_add(count, Ordering::SeqCst);
