@@ -503,6 +503,56 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                                     response["error"] = json!({"code": -32602, "message": "Missing arguments"});
                                 }
                             },
+                            "search_logs_around" => {
+                                if let Some(args_obj) = args {
+                                    if let Some(id) = args_obj.get("id").and_then(Value::as_u64) {
+                                        let before_n = args_obj.get("before").and_then(Value::as_u64).unwrap_or(0) as i64;
+                                        let after_n = args_obj.get("after").and_then(Value::as_u64).unwrap_or(0) as i64;
+                                        match search_logs_around(&data.conn, id as i64, before_n, after_n).await {
+                                            Ok(text) => {
+                                                response["result"] = json!({"content": [{"type": "text", "text": text}]});
+                                            },
+                                            Err(e) => {
+                                                error!("Error fetching logs around: {:?}", e);
+                                                response["error"] = json!({"code": -32603, "message": "Database error"});
+                                            }
+                                        }
+                                    } else {
+                                        response["error"] = json!({"code": -32602, "message": "Missing or invalid 'id' parameter"});
+                                    }
+                                } else {
+                                    response["error"] = json!({"code": -32602, "message": "Missing arguments"});
+                                }
+                            },
+                            "summarize_logs" => {
+                                if let Some(args_obj) = args {
+                                    let minutes = args_obj.get("minutes").and_then(Value::as_u64).unwrap_or(0) as i64;
+                                    let service_opt = args_obj.get("service").and_then(Value::as_str);
+                                    let level_opt = args_obj.get("level").and_then(Value::as_str);
+                                    match summarize_logs(&data.conn, service_opt, level_opt, minutes).await {
+                                        Ok(text) => {
+                                            response["result"] = json!({"content": [{"type": "text", "text": text}]});
+                                        },
+                                        Err(e) => {
+                                            error!("Error summarizing logs: {:?}", e);
+                                            response["error"] = json!({"code": -32603, "message": "Database error"});
+                                        }
+                                    }
+                                } else {
+                                    response["error"] = json!({"code": -32602, "message": "Missing arguments"});
+                                }
+                            },
+                            "get_metrics" => {
+                                match get_metrics_text(&data.conn, &data.db_url).await {
+                                    Ok(text) => {
+                                        response["result"] = json!({"content": [{"type": "text", "text": text}]});
+                                    },
+                                    Err(e) => {
+                                        error!("Error getting metrics: {:?}", e);
+                                        response["error"] = json!({"code": -32603, "message": "Database error"});
+                                    }
+                                }
+                            },
                             _ => {
                                 response["error"] = json!({"code": -32601, "message": format!("Tool not found: {}", name)});
                             }
@@ -680,6 +730,92 @@ async fn tail_logs(conn: &Connection, _service: Option<&str>, _level: Option<&st
     let start = if (lines as usize) < lines_vec.len() { lines_vec.len() - lines as usize } else { 0 };
     let selected = &lines_vec[start..];
     Ok(selected.join("\n"))
+}
+
+// Add helper functions for the remaining tools
+async fn search_logs_around(conn: &Connection, id: i64, before: i64, after: i64) -> Result<String, libsql::Error> {
+    // Fetch entries before the ID
+    let sql_before = format!(
+        "SELECT json_object('id', id, 'ts', ts, 'level', level, 'service', service, 'body', body) FROM logs WHERE id < {} ORDER BY id DESC LIMIT {}",
+        id, before
+    );
+    let mut rows_before = conn.query(&sql_before, ()).await?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows_before.next().await? {
+        let json: String = row.get(0)?;
+        entries.push(json);
+    }
+    entries.reverse();
+    // Center entry
+    if let Ok(center) = get_log_by_id(conn, id).await {
+        if center != "{}" {
+            entries.push(center);
+        }
+    }
+    // Entries after the ID
+    let sql_after = format!(
+        "SELECT json_object('id', id, 'ts', ts, 'level', level, 'service', service, 'body', body) FROM logs WHERE id > {} ORDER BY id ASC LIMIT {}",
+        id, after
+    );
+    let mut rows_after = conn.query(&sql_after, ()).await?;
+    while let Some(row) = rows_after.next().await? {
+        let json: String = row.get(0)?;
+        entries.push(json);
+    }
+    Ok(format!("[{}]", entries.join(",")))
+}
+
+async fn summarize_logs(conn: &Connection, service: Option<&str>, level: Option<&str>, minutes: i64) -> Result<String, libsql::Error> {
+    let since = (Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+    // Total count
+    let sql_total = format!("SELECT COUNT(*) FROM logs WHERE ts >= '{}'", since);
+    let mut total_rows = conn.query(&sql_total, ()).await?;
+    let total = total_rows.next().await?.map(|r| r.get::<i64>(0).unwrap_or(0)).unwrap_or(0);
+    // Breakdown by level
+    let sql_breakdown = if let Some(svc) = service {
+        if let Some(lvl) = level {
+            format!(
+                "SELECT level, COUNT(*) FROM logs WHERE ts >= '{}' AND service = '{}' AND level = '{}' GROUP BY level",
+                since, svc, lvl
+            )
+        } else {
+            format!(
+                "SELECT level, COUNT(*) FROM logs WHERE ts >= '{}' AND service = '{}' GROUP BY level",
+                since, svc
+            )
+        }
+    } else if let Some(lvl) = level {
+        format!(
+            "SELECT level, COUNT(*) FROM logs WHERE ts >= '{}' AND level = '{}' GROUP BY level",
+            since, lvl
+        )
+    } else {
+        format!(
+            "SELECT level, COUNT(*) FROM logs WHERE ts >= '{}' GROUP BY level",
+            since
+        )
+    };
+    let mut breakdown_rows = conn.query(&sql_breakdown, ()).await?;
+    let mut parts = Vec::new();
+    while let Some(row) = breakdown_rows.next().await? {
+        let lvl: String = row.get(0)?;
+        let cnt: i64 = row.get(1)?;
+        parts.push(format!("{}: {}", lvl, cnt));
+    }
+    let breakdown = if parts.is_empty() { "None".to_string() } else { parts.join(", ") };
+    Ok(format!("Logs in past {} minutes: {}\nBy level: {}", minutes, total, breakdown))
+}
+
+// Add helper function for get_metrics_text
+async fn get_metrics_text(conn: &Connection, db_url: &str) -> Result<String, libsql::Error> {
+    let ingested = LOGS_INGESTED.load(Ordering::SeqCst);
+    let failed = INGESTION_FAILURES.load(Ordering::SeqCst);
+    let db_size = if db_url == ":memory:" {
+        0
+    } else {
+        fs::metadata(db_url).map(|m| m.len()).unwrap_or(0)
+    };
+    Ok(format!("Ingested: {}\nFailed: {}\nDB size: {} bytes", ingested, failed, db_size))
 }
 
 /// Admin UI: display log count, db size, health, and metrics
