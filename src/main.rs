@@ -637,6 +637,52 @@ async fn fetch_service_logs_text(conn: &Connection, service: &str) -> Result<Str
     Ok(buf)
 }
 
+/// Admin UI: display log count, db size, and clear logs button
+async fn admin_ui(data: web::Data<AppState>) -> impl Responder {
+    // count logs
+    let count: i64 = match data.conn.query("SELECT COUNT(*) FROM logs", ()).await {
+        Ok(mut rows) => {
+            if let Some(row) = rows.next().await.unwrap_or(None) {
+                row.get(0).unwrap_or(0)
+            } else { 0 }
+        }
+        Err(_) => 0,
+    };
+    // db size
+    let db_size = if data.db_url == ":memory:" {
+        0
+    } else {
+        fs::metadata(&data.db_url).map(|m| m.len()).unwrap_or(0)
+    };
+    // render html
+    let html = format!(r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Loggy Admin</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  </head>
+  <body class="container py-5">
+    <h1>Loggy Admin Interface</h1>
+    <p>Number of logs: <strong>{count}</strong></p>
+    <p>Database size: <strong>{db_size} bytes</strong></p>
+    <form method="post" action="/admin/clear">
+      <button type="submit" class="btn btn-danger">Clear Logs</button>
+    </form>
+  </body>
+</html>"#, count=count, db_size=db_size);
+    HttpResponse::Ok().content_type("text/html; charset=utf-8").body(html)
+}
+
+/// Clear all logs and redirect to admin UI
+async fn clear_logs(data: web::Data<AppState>) -> impl Responder {
+    if let Err(e) = data.conn.execute_batch("DELETE FROM logs; DELETE FROM logs_fts;").await {
+        error!("Error clearing logs: {:?}", e);
+    }
+    HttpResponse::SeeOther().append_header(("Location", "/")).finish()
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let config = Config::parse();
@@ -647,6 +693,9 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            // Admin interface
+            .route("/", web::get().to(admin_ui))
+            .route("/admin/clear", web::post().to(clear_logs))
             .route("/logs/ndjson", web::post().to(ingest_ndjson))
             .route("/v1/logs", web::post().to(ingest_otlp))
             .route("/mcp/sse", web::get().to(mcp_sse))
