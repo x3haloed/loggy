@@ -1,5 +1,5 @@
 use actix_web::{web, App, HttpServer, HttpResponse, Responder};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use libsql::{Builder, Connection};
 use clap::Parser;
@@ -59,7 +59,7 @@ async fn ingest_ndjson(
 ) -> impl Responder {
     let hostname = get_hostname().unwrap_or_default().to_string_lossy().to_string();
     let pid = process::id();
-    let mut tx = data.conn.transaction().await.unwrap();
+    let tx = data.conn.transaction().await.unwrap();
     let mut count = 0;
     for (i, line) in body.lines().enumerate() {
         if line.trim().is_empty() { continue; }
@@ -161,7 +161,7 @@ async fn ingest_otlp(
 ) -> impl Responder {
     let hostname = get_hostname().unwrap_or_default().to_string_lossy().to_string();
     let pid = process::id();
-    let mut tx = data.conn.transaction().await.unwrap();
+    let tx = data.conn.transaction().await.unwrap();
     let mut count = 0;
     for resource in &req.resource_logs {
         for ils in &resource.instrumentation_library_logs {
