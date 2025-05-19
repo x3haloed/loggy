@@ -102,52 +102,73 @@ curl -X POST -H 'Content-Type: application/json' \
      http://localhost:8080/v1/logs
 ```
 
-#### C# (OpenTelemetry OTLP exporter)
+## Integrating Loggy with Serilog in ASP.NET Core
 
-Add the following NuGet packages:
+## 1. Prerequisites  
+- Have Loggy running locally:  
+  ```bash
+  loggy --port 8080 --db-url ./loggy.db
+  ```  
+- Your ASP.NET Core project (target .NET 7/8)  
 
-```sh
-dotnet add package OpenTelemetry
-dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
+## 2. Add NuGet Packages  
+```bash
+dotnet add package Serilog.AspNetCore
+dotnet add package Serilog.Sinks.OpenTelemetry
 ```
 
-Then configure your logging in `Program.cs`:
+## 3. Bootstrap Serilog in `Program.cs`  
+1. **At the very top** of the file, before `CreateBuilder(args)`:  
+   ```csharp
+   using Serilog;
+   using Serilog.Sinks.OpenTelemetry;
+   ```  
+2. **Replace** the default host logger with Serilog, and configure sinks:  
+   ```csharp
+   var builder = WebApplication.CreateBuilder(args);
 
+   // Replace built-in logging
+   builder.Host.UseSerilog((hostingContext, services, lc) => {
+       lc.Enrich.FromLogContext()
+         // Always write to console:
+         .WriteTo.Console();
+
+   #if DEBUG
+       // Only in DEBUG + Development, send to your local Loggy OTLP endpoint:
+       if (hostingContext.HostingEnvironment.IsDevelopment())
+       {
+           lc.WriteTo.OpenTelemetry(
+             endpoint: "http://localhost:8080/v1/logs",
+             protocol: OtlpProtocol.HttpProtobuf);
+       }
+   #endif
+   });
+   ```
+
+## 4. (Optional) Enable HTTP-Request Logging  
 ```csharp
-using Microsoft.Extensions.Logging;
-using OpenTelemetry;
-using OpenTelemetry.Logs;
-using OpenTelemetry.Resources;
+var app = builder.Build();
 
-var loggerFactory = LoggerFactory.Create(builder =>
-{
-    builder.ClearProviders();
-    builder.AddOpenTelemetry(options =>
-    {
-        // Identify your service
-        options.SetResourceBuilder(
-            ResourceBuilder.CreateDefault()
-                .AddService("MyService"));
-        // Include formatted messages and state values
-        options.IncludeFormattedMessage = true;
-        options.ParseStateValues = true;
-        // Export to Loggy's OTLP endpoint
-        options.AddOtlpExporter(otlp =>
-        {
-            otlp.Endpoint = new Uri("http://localhost:8080/v1/logs");
-        });
-    });
-});
-
-var logger = loggerFactory.CreateLogger<Program>();
-logger.LogInformation("User {User} logged in", userId);
+// **Before** UseRouting/UseAuthorization/AddControllers:
+app.UseSerilogRequestLogging();  
 ```
+This emits one concise log per HTTP request, with method, path, status, and timing.
+
+## 5. Run & Verify  
+1. Start your ASP.NET app in **Development** (`dotnet run` in DEBUG).  
+2. Exercise an endpoint (e.g. `curl http://localhost:5000/`).  
+3. In another shell, tail Loggy's logs:  
+   ```bash
+   loggy tail_logs --lines=20
+   ```  
+   You should see your app's info/debug entries flowing into Loggy.
+
+## 6. Tips & Best Practices  
+- Use `Log.Debug(...)` and structure-enriched logs liberally in services and controllers.  
+- In production (non-DEBUG), you'll still get console logs (or add other sinks) without spamming your OTLP endpoint.  
+- Pair with filters/overrides (`MinimumLevel.Override("Microsoft", LogEventLevel.Warning)`) to suppress verbose framework noise.
 
 ---
-
-## License
-
-MIT
 
 API Endpoints
 -------------
