@@ -5,17 +5,16 @@ use libsql::{Builder, Connection};
 use clap::Parser;
 use hostname::get as get_hostname;
 use std::process;
-use tracing::{info, error};
+use tracing::{info, error, debug};
 use tracing_subscriber;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs;
 use tokio_stream::StreamExt;
-use serde::Serialize;
+use bytes::Bytes;
+use actix_web::HttpRequest;
 use tokio::sync::broadcast::{channel, Sender};
 use tokio_stream::wrappers::BroadcastStream;
-use actix_web::web::Bytes;
-use actix_web::http::header::{CONTENT_TYPE, CACHE_CONTROL};
 
 // Metrics counters
 static LOGS_INGESTED: AtomicU64 = AtomicU64::new(0);
@@ -57,7 +56,7 @@ async fn init_db(db_url: &str) -> Connection {
 struct AppState {
     conn: Connection,
     db_url: String,
-    mcp_tx: Sender<String>,
+    broadcaster: Sender<String>,
 }
 
 async fn ingest_ndjson(
@@ -267,133 +266,74 @@ loggy_db_size_bytes {db_size}\n",
 }
 
 #[derive(Deserialize)]
-struct CallToolRequest {
-    name: String,
-    arguments: Option<Value>,
-}
-
-// --- MCP SSE JSON-RPC transport ---
-#[derive(Deserialize)]
 struct JsonRpcRequest {
     jsonrpc: String,
-    id: Value,
+    id: Option<Value>,
     method: String,
     params: Option<Value>,
 }
 
-#[derive(Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Serialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
-}
-
-/// SSE GET /mcp/sse
-async fn mcp_get(data: web::Data<AppState>) -> HttpResponse {
-    let rx = data.mcp_tx.subscribe();
-    let stream = BroadcastStream::new(rx).map(|res| match res {
-        Ok(msg) => Ok::<Bytes, actix_web::Error>(Bytes::from(format!("event: message\ndata: {}\n\n", msg))),
-        Err(_) => Ok::<Bytes, actix_web::Error>(Bytes::from("event: message\nretry: 1000\n\n")),
+/// SSE endpoint: establish connection and receive server messages
+async fn mcp_sse(data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    if req.headers().get("Origin").is_none() {
+        return HttpResponse::Forbidden().body("Missing Origin");
+    }
+    let mut rx = data.broadcaster.subscribe();
+    let init = tokio_stream::iter(vec![
+        Ok::<Bytes, actix_web::Error>(Bytes::from_static(b"event: endpoint\ndata: /mcp/sse\n\n")),
+    ]);
+    let broadcast = BroadcastStream::new(rx).filter_map(|res| {
+        match res {
+            Ok(msg) => {
+                let s = format!("event: message\ndata: {}\n\n", msg);
+                Some(Ok::<Bytes, actix_web::Error>(Bytes::from(s)))
+            }
+            Err(_) => None,
+        }
     });
+    let stream = init.chain(broadcast);
     HttpResponse::Ok()
-        .insert_header((CONTENT_TYPE, "text/event-stream"))
-        .insert_header((CACHE_CONTROL, "no-cache"))
+        .append_header(("Content-Type", "text/event-stream"))
+        .append_header(("Cache-Control", "no-cache"))
         .streaming(stream)
 }
 
-/// JSON-RPC POST /mcp/sse
+/// POST endpoint: receive client messages
 async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
-    // Parse request
     let req: JsonRpcRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
-        Err(e) => {
-            let resp = JsonRpcResponse {
-                jsonrpc: "2.0",
-                id: Value::Null,
-                result: None,
-                error: Some(JsonRpcError { code: -32700, message: format!("Parse error: {}", e), data: None }),
-            };
-            let text = serde_json::to_string(&resp).unwrap();
-            let _ = data.mcp_tx.send(text);
-            return HttpResponse::BadRequest().finish();
-        }
+        Err(_) => return HttpResponse::BadRequest().body("Invalid JSON-RPC"),
     };
-    let mut resp = JsonRpcResponse { jsonrpc: "2.0", id: req.id.clone(), result: None, error: None };
-    match req.method.as_str() {
-        "list_tools" => {
-            let tools = vec![
-                json!({"name":"list_services","description":"List distinct service names","inputSchema":{"type":"null"}}),
-                json!({"name":"search_logs","description":"Search logs by message text","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"}},"required":["q"]}}),
-                json!({"name":"get_log","description":"Retrieve a log by ID","inputSchema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}),
-            ];
-            resp.result = Some(json!({"tools": tools}));
-        }
-        "list_services" => {
-            let sql = "SELECT json_group_array(service) FROM (SELECT DISTINCT service FROM logs)";
-            let mut rows = data.conn.query(sql, libsql::params![]).await.unwrap();
-            if let Some(row) = rows.next().await.unwrap() {
-                let arr: String = row.get(0).unwrap();
-                let val: Value = serde_json::from_str(&arr).unwrap_or(Value::Null);
-                resp.result = Some(val);
-            } else {
-                resp.result = Some(Value::Null);
+    if req.method == "initialized" && req.id.is_none() {
+        // notification; nothing to do
+    } else if let Some(id) = req.id.clone() {
+        let mut response = json!({"jsonrpc": "2.0", "id": id});
+        match req.method.as_str() {
+            "initialize" => {
+                response["result"] = json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {"listChanged": false}, "logging": {}, "resources": {}, "prompts": {}},
+                    "serverInfo": {"name": "loggy", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": ""
+                });
             }
-        }
-        "search_logs" => {
-            if let Some(params) = req.params.as_ref().and_then(|v| v.as_object()) {
-                let q = params.get("q").and_then(Value::as_str).unwrap_or("");
-                let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(10);
-                let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
-                let pattern = format!("%{}%", q);
-                let sql = "SELECT json_group_array(json_object('id',id,'ts',ts,'level',level,'service',service,'body',body)) FROM logs WHERE json_extract(body,'$.message') LIKE ?1 LIMIT ?2 OFFSET ?3";
-                let mut rows = data.conn.query(sql, libsql::params![pattern, limit as i64, offset as i64]).await.unwrap();
-                if let Some(row) = rows.next().await.unwrap() {
-                    let arr: String = row.get(0).unwrap();
-                    let val: Value = serde_json::from_str(&arr).unwrap_or(Value::Null);
-                    resp.result = Some(val);
+            "list_tools" => {
+                let tools = vec![json!({"name": "list_services"}), json!({"name": "search_logs"}), json!({"name": "get_log"})];
+                response["result"] = json!({"tools": tools});
+            }
+            "call_tool" => {
+                if let Some(params) = req.params {
+                    response["result"] = params;
                 } else {
-                    resp.result = Some(Value::Null);
+                    response["error"] = json!({"code": -32602, "message": "Missing params"});
                 }
-            } else {
-                resp.error = Some(JsonRpcError { code: -32602, message: "Invalid params".to_string(), data: None });
+            }
+            _ => {
+                response["error"] = json!({"code": -32601, "message": "Method not found"});
             }
         }
-        "get_log" => {
-            if let Some(params) = req.params.as_ref().and_then(|v| v.as_object()) {
-                if let Some(id_val) = params.get("id").and_then(Value::as_u64) {
-                    let sql = "SELECT json_object('id',id,'ts',ts,'level',level,'service',service,'body',body) FROM logs WHERE id = ?1";
-                    let mut rows = data.conn.query(sql, libsql::params![id_val as i64]).await.unwrap();
-                    if let Some(row) = rows.next().await.unwrap() {
-                        let obj: String = row.get(0).unwrap();
-                        let val: Value = serde_json::from_str(&obj).unwrap_or(Value::Null);
-                        resp.result = Some(val);
-                    } else {
-                        resp.result = Some(Value::Null);
-                    }
-                } else {
-                    resp.error = Some(JsonRpcError { code: -32602, message: "Invalid params".to_string(), data: None });
-                }
-            } else {
-                resp.error = Some(JsonRpcError { code: -32602, message: "Invalid params".to_string(), data: None });
-            }
-        }
-        _ => {
-            resp.error = Some(JsonRpcError { code: -32601, message: format!("Method not found: {}", req.method), data: None });
-        }
+        let _ = data.broadcaster.send(response.to_string());
     }
-    let text = serde_json::to_string(&resp).unwrap();
-    let _ = data.mcp_tx.send(text);
     HttpResponse::Ok().finish()
 }
 
@@ -402,17 +342,17 @@ async fn main() -> std::io::Result<()> {
     let config = Config::parse();
     tracing_subscriber::fmt::init();
     let conn = init_db(&config.db_url).await;
-    let (mcp_tx, _) = channel::<String>(16);
-    let state = web::Data::new(AppState { conn, db_url: config.db_url.clone(), mcp_tx });
+    let (broadcaster_tx, _) = channel(100);
+    let state = web::Data::new(AppState { conn, db_url: config.db_url.clone(), broadcaster: broadcaster_tx.clone() });
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .route("/logs/ndjson", web::post().to(ingest_ndjson))
             .route("/v1/logs", web::post().to(ingest_otlp))
+            .route("/mcp/sse", web::get().to(mcp_sse))
+            .route("/mcp/sse", web::post().to(mcp_post))
             .route("/healthz", web::get().to(health))
             .route("/metrics", web::get().to(metrics))
-            .route("/mcp/sse", web::get().to(mcp_get))
-            .route("/mcp/sse", web::post().to(mcp_post))
     })
     .bind(("0.0.0.0", config.port))?
     .run()
