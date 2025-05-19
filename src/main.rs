@@ -8,6 +8,12 @@ use std::process;
 use tracing::{info, error};
 use tracing_subscriber;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs;
+
+// Metrics counters
+static LOGS_INGESTED: AtomicU64 = AtomicU64::new(0);
+static INGESTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -44,6 +50,7 @@ async fn init_db(db_url: &str) -> Connection {
 
 struct AppState {
     conn: Connection,
+    db_url: String,
 }
 
 async fn ingest_ndjson(
@@ -60,24 +67,25 @@ async fn ingest_ndjson(
             Ok(serde_json::Value::Object(map)) => map,
             _ => {
                 error!("Invalid JSON at line {}", i+1);
+                INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
                 return HttpResponse::BadRequest().json(json!({"error": format!("Invalid JSON at line {}", i+1)}));
             }
         };
         let ts = match v.remove("timestamp").and_then(|v| v.as_str().map(|s| s.to_string())) {
             Some(val) => val,
-            None => return HttpResponse::BadRequest().json(json!({"error": format!("Missing or invalid timestamp at line {}", i+1)})),
+            None => { INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst); return HttpResponse::BadRequest().json(json!({"error": format!("Missing or invalid timestamp at line {}", i+1)})); }
         };
         let level = match v.remove("level").and_then(|v| v.as_str().map(|s| s.to_string())) {
             Some(val) => val,
-            None => return HttpResponse::BadRequest().json(json!({"error": format!("Missing or invalid level at line {}", i+1)})),
+            None => { INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst); return HttpResponse::BadRequest().json(json!({"error": format!("Missing or invalid level at line {}", i+1)})); }
         };
         let service = match v.remove("service").and_then(|v| v.as_str().map(|s| s.to_string())) {
             Some(val) => val,
-            None => return HttpResponse::BadRequest().json(json!({"error": format!("Missing or invalid service at line {}", i+1)})),
+            None => { INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst); return HttpResponse::BadRequest().json(json!({"error": format!("Missing or invalid service at line {}", i+1)})); }
         };
         let message = match v.remove("message") {
             Some(val) => val,
-            None => return HttpResponse::BadRequest().json(json!({"error": format!("Missing message at line {}", i+1)})),
+            None => { INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst); return HttpResponse::BadRequest().json(json!({"error": format!("Missing message at line {}", i+1)})); }
         };
         // Enrich metadata
         v.insert("host_name".to_string(), serde_json::Value::String(hostname.clone()));
@@ -88,11 +96,13 @@ async fn ingest_ndjson(
                                    (ts, level, service, body_str)
         ).await {
             error!("DB insert error: {:?}", e);
+            INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
             return HttpResponse::InternalServerError().json(json!({"error": "Database insert error"}));
         }
         count += 1;
     }
     tx.commit().await.unwrap();
+    LOGS_INGESTED.fetch_add(count, Ordering::SeqCst);
     info!("Ingested {} records", count);
     HttpResponse::Ok().json(json!({"ingested": count}))
 }
@@ -198,6 +208,7 @@ async fn ingest_otlp(
                     (ts, level, service.clone(), body_str),
                 ).await {
                     error!("OTLP DB insert error: {:?}", e);
+                    INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
                     return HttpResponse::InternalServerError().json(json!({"error": "Database insert error"}));
                 }
                 count += 1;
@@ -205,8 +216,47 @@ async fn ingest_otlp(
         }
     }
     tx.commit().await.unwrap();
+    LOGS_INGESTED.fetch_add(count, Ordering::SeqCst);
     info!("OTLP Ingested {} records", count);
     HttpResponse::Ok().json(json!({"ingested": count}))
+}
+
+/// Health check endpoint
+async fn health(data: web::Data<AppState>) -> impl Responder {
+    if data.conn.execute("SELECT 1", ()).await.is_ok() {
+        HttpResponse::Ok().body("OK")
+    } else {
+        HttpResponse::InternalServerError().body("DB unreachable")
+    }
+}
+
+/// Prometheus-style metrics endpoint
+async fn metrics(data: web::Data<AppState>) -> impl Responder {
+    let ingested = LOGS_INGESTED.load(Ordering::SeqCst);
+    let failed = INGESTION_FAILURES.load(Ordering::SeqCst);
+    let db_size = if data.db_url == ":memory:" {
+        0
+    } else {
+        fs::metadata(&data.db_url).map(|m| m.len()).unwrap_or(0)
+    };
+    let body = format!(
+        "\
+# HELP loggy_ingested_total Total number of log records ingested\n\
+# TYPE loggy_ingested_total counter\n\
+loggy_ingested_total {ingested}\n\
+# HELP loggy_failed_ingestions_total Total number of failed ingestion requests\n\
+# TYPE loggy_failed_ingestions_total counter\n\
+loggy_failed_ingestions_total {failed}\n\
+# HELP loggy_db_size_bytes Current size of the DB file in bytes\n\
+# TYPE loggy_db_size_bytes gauge\n\
+loggy_db_size_bytes {db_size}\n",
+        ingested = ingested,
+        failed = failed,
+        db_size = db_size,
+    );
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(body)
 }
 
 #[actix_web::main]
@@ -214,12 +264,14 @@ async fn main() -> std::io::Result<()> {
     let config = Config::parse();
     tracing_subscriber::fmt::init();
     let conn = init_db(&config.db_url).await;
-    let state = web::Data::new(AppState { conn });
+    let state = web::Data::new(AppState { conn, db_url: config.db_url.clone() });
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .route("/logs/ndjson", web::post().to(ingest_ndjson))
             .route("/v1/logs", web::post().to(ingest_otlp))
+            .route("/healthz", web::get().to(health))
+            .route("/metrics", web::get().to(metrics))
     })
     .bind(("0.0.0.0", config.port))?
     .run()
