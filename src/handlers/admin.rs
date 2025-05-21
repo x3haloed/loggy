@@ -12,14 +12,13 @@ pub async fn admin_ui(data: web::Data<AppState>) -> impl Responder {
     // count logs
     let count: i64 = match data.conn.query("SELECT COUNT(*) FROM logs", ()).await {
         Ok(mut rows) => {
-            if let Some(row_result) = rows.next().await {
-                match row_result {
-                    Ok(row) => row.get(0).unwrap_or(0),
-                    Err(_) => 0, // Error fetching row
-                }
-            } else { 0 } // No rows
+            match rows.next().await {
+                Ok(Some(row)) => row.get(0).unwrap_or(0),
+                Ok(None) => 0,
+                Err(_) => 0,
+            }
         }
-        Err(_) => 0, // Error executing query
+        Err(_) => 0,
     };
     // db size
     let db_size = if data.db_url == ":memory:" {

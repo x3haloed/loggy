@@ -1,29 +1,12 @@
-use actix_web::{web, App, HttpServer, HttpResponse, Responder};
-use serde::Deserialize;
-use serde_json::{json, Value};
-use libsql::{Builder, Connection};
+use actix_web::{web, App, HttpServer};
+use libsql::{Connection};
 use clap::Parser;
-use hostname::get as get_hostname;
-use std::process;
 use tracing::{info, error};
 use tracing_subscriber;
-use chrono::{DateTime, NaiveDateTime, Utc};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::fs;
-use tokio_stream::StreamExt;
-use bytes::Bytes;
-use actix_web::HttpRequest;
+use std::sync::atomic::{AtomicU64};
 use tokio::sync::broadcast::{channel, Sender};
 use tokio::sync::Mutex;
 use std::collections::HashSet;
-use lazy_static::lazy_static;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::wrappers::IntervalStream;
-use std::time::Duration;
-use prost::Message;
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest as ProtoExportLogsServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue as ProtoAnyValue, KeyValue as ProtoKeyValue};
-use opentelemetry_proto::tonic::common::v1::any_value::Value as ProtoAnyValueKind;
 
 mod db;
 mod handlers;
@@ -82,7 +65,7 @@ async fn main() -> std::io::Result<()> {
 
     // Initialize known_services
     let mut initial_services = HashSet::new();
-    match list_distinct_services(&conn, -1, 0).await { // Fetch all for initial population
+    match list_distinct_services(&conn).await { // Fetch all for initial population
         Ok(services) => {
             for service in services {
                 initial_services.insert(service);

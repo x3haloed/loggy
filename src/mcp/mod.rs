@@ -22,7 +22,7 @@ use crate::{LOGS_INGESTED, INGESTION_FAILURES}; // Atomics from main.rs
 use crate::mcp::types::{INVALID_PARAMS, METHOD_NOT_FOUND, INTERNAL_ERROR}; // Error codes
 // The helper functions like list_distinct_services, search_logs etc. are now in crate::mcp::tools
 use crate::mcp::resources::{fetch_all_logs_text, fetch_service_logs_text}; // Added for resource helpers
-use crate::mcp::tools; // For list_distinct_services used in resources/list
+use crate::mcp::tools::list_distinct_services; // For list_distinct_services used in resources/list
 // Note: fetch_all_logs_text and fetch_service_logs_text are already imported at the top level of this file.
 
 // Moved from main.rs
@@ -378,7 +378,7 @@ pub async fn handle_mcp_post_request(body: String, data: web::Data<AppState>) ->
                         }));
                     } else {
                         let db_offset = effective_idx - num_static_resources;
-                        let services = tools::list_distinct_services(&data.conn, 1, db_offset as i64).await.unwrap_or_default();
+                        let services = list_distinct_services(&data.conn, 1, db_offset as i64).await.unwrap_or_default();
                         if let Some(service_name) = services.get(0) {
                             let service_logs_content = fetch_service_logs_text(&data.conn, service_name).await.unwrap_or_default();
                             resources_on_page.push(json!({
@@ -399,7 +399,7 @@ pub async fn handle_mcp_post_request(body: String, data: web::Data<AppState>) ->
                     final_next_cursor = Some(effective_idx);
                 } else { 
                     let db_offset_check = effective_idx - num_static_resources;
-                    let services_check = tools::list_distinct_services(&data.conn, 1, db_offset_check as i64).await.unwrap_or_default();
+                    let services_check = list_distinct_services(&data.conn, 1, db_offset_check as i64).await.unwrap_or_default();
                     if !services_check.is_empty() {
                         final_next_cursor = Some(effective_idx);
                     }
