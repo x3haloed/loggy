@@ -65,7 +65,7 @@ async fn main() -> std::io::Result<()> {
 
     // Initialize known_services
     let mut initial_services = HashSet::new();
-    match list_distinct_services(&conn).await { // Fetch all for initial population
+    match list_distinct_services(&conn, -1, 0).await { // Fetch all for initial population
         Ok(services) => {
             for service in services {
                 initial_services.insert(service);

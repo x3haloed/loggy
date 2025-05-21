@@ -7,13 +7,16 @@ use std::sync::atomic::Ordering;
 use crate::mcp::resources::fetch_all_logs_text; // Using the moved function
 
 
-pub async fn list_distinct_services(conn: &Connection) -> Result<Vec<String>, LibsqlError> {
-    // The pagination for this specific tool call is handled in mcp/mod.rs or will be if not already.
-    // This helper should ideally fetch all or be adapted if the direct caller needs pagination.
-    // For now, assuming it fetches all as per its original direct use in main.rs before full MCP refactor.
-    let mut rows = conn.query("SELECT DISTINCT service FROM logs ORDER BY service", ()).await?;
+pub async fn list_distinct_services(conn: &Connection, limit: i64, offset: i64) -> Result<Vec<String>, LibsqlError> {
+    // Fetch distinct services, optionally paginated by limit/offset
+    let base_sql = "SELECT DISTINCT service FROM logs ORDER BY service";
+    let mut rows = if limit < 0 {
+        conn.query(base_sql, ()).await?
+    } else {
+        let paged_sql = format!("{} LIMIT ? OFFSET ?", base_sql);
+        conn.query(&paged_sql, params![limit, offset]).await?
+    };
     let mut services = Vec::new();
-    
     while let Some(row) = rows.next().await? {
         if let Ok(service) = row.get::<String>(0) {
             services.push(service);

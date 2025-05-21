@@ -194,7 +194,7 @@ pub async fn handle_mcp_post_request(body: String, data: web::Data<AppState>) ->
                     if let Some(name) = tool_name_opt {
                         match name {
                             "list_services" => {
-                                match crate::mcp::tools::list_distinct_services(&data.conn).await {
+                                match crate::mcp::tools::list_distinct_services(&data.conn, -1, 0).await {
                                     Ok(services) => {
                                         let text = format!("Available services: {}", services.join(", "));
                                         response["result"] = json!({"content": [{"type": "text", "text": text}]});
