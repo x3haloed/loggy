@@ -14,6 +14,9 @@ use tokio_stream::StreamExt;
 use bytes::Bytes;
 use actix_web::HttpRequest;
 use tokio::sync::broadcast::{channel, Sender};
+use tokio::sync::Mutex;
+use std::collections::HashSet;
+use lazy_static::lazy_static;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::IntervalStream;
 use std::time::Duration;
@@ -64,7 +67,18 @@ struct AppState {
     db_url: String,
     broadcaster: Sender<String>,
     port: u16,
+    known_services: Mutex<HashSet<String>>,
+    mcp_log_level: Mutex<String>,
 }
+
+lazy_static! {
+    static ref VALID_LOG_LEVELS: HashSet<String> = {
+        vec!["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"]
+            .into_iter().map(String::from).collect()
+    };
+}
+
+const INVALID_PARAMS: i32 = -32602;
 
 async fn ingest_ndjson(
     body: String,
@@ -74,6 +88,7 @@ async fn ingest_ndjson(
     let pid = process::id();
     let tx = data.conn.transaction().await.unwrap();
     let mut count = 0;
+    let mut new_service_detected_in_batch = false; // Flag for new service detection
     for (i, line) in body.lines().enumerate() {
         if line.trim().is_empty() { continue; }
         let mut v = match serde_json::from_str::<serde_json::Value>(line) {
@@ -96,17 +111,28 @@ async fn ingest_ndjson(
             Some(val) => val,
             None => { INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst); return HttpResponse::BadRequest().json(json!({"error": format!("Missing or invalid service at line {}", i+1)})); }
         };
+        let service_name = service.clone(); // Clone for use after v.remove("service") potentially
         let message = match v.remove("message") {
             Some(val) => val,
             None => { INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst); return HttpResponse::BadRequest().json(json!({"error": format!("Missing message at line {}", i+1)})); }
         };
+
+        // Check if service_name is new
+        {
+            let mut known_services_guard = data.known_services.lock().await;
+            if known_services_guard.insert(service_name.clone()) {
+                new_service_detected_in_batch = true;
+                info!("New service '{}' detected during NDJSON ingestion", service_name);
+            }
+        } // Lock released
+
         // Enrich metadata
         v.insert("host_name".to_string(), serde_json::Value::String(hostname.clone()));
         v.insert("process_id".to_string(), serde_json::Value::Number(pid.into()));
         v.insert("message".to_string(), message.clone());
         let body_str = serde_json::Value::Object(v).to_string();
         if let Err(e) = tx.execute("INSERT INTO logs (ts, level, service, body) VALUES (?1, ?2, ?3, ?4)",
-                                   (ts, level, service, body_str)
+                                   (ts, level, service_name, body_str) // Use service_name
         ).await {
             error!("DB insert error: {:?}", e);
             INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
@@ -116,7 +142,22 @@ async fn ingest_ndjson(
     }
     tx.commit().await.unwrap();
     LOGS_INGESTED.fetch_add(count, Ordering::SeqCst);
-    info!("Ingested {} records", count);
+    info!("Ingested {} records via NDJSON", count);
+
+    // Send notification if new services were added
+    if new_service_detected_in_batch {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/list_changed",
+            "params": {}
+        });
+        if let Err(e) = data.broadcaster.send(notification.to_string()) {
+            error!("Failed to send resources/list_changed notification (NDJSON): {}", e);
+        } else {
+            info!("Sent notifications/resources/list_changed notification (NDJSON)");
+        }
+    }
+
     HttpResponse::Ok().json(json!({"ingested": count}))
 }
 
@@ -177,6 +218,7 @@ async fn ingest_otlp(
     let pid = process::id();
     let tx = data.conn.transaction().await.unwrap();
     let mut count = 0;
+    let mut new_service_detected_in_batch = false; // Flag for new service detection
     // dispatch based on Content-Type
     let ct = req.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("");
     if ct.starts_with("application/x-protobuf") {
@@ -200,14 +242,24 @@ async fn ingest_otlp(
                     let datetime: DateTime<Utc> = DateTime::from_utc(naive, Utc);
                     let ts = datetime.to_rfc3339();
                     let level = log.severity_text.clone();
-                    let mut service = "unknown".to_string();
+                    let mut service_name = "unknown".to_string();
                     for kv in &log.attributes {
                         if kv.key == "service.name" {
                             if let Some(ProtoAnyValue { value: Some(ProtoAnyValueKind::StringValue(s)) }) = &kv.value {
-                                service = s.clone();
+                                service_name = s.clone();
                             }
                         }
                     }
+
+                    // Check if service_name is new
+                    {
+                        let mut known_services_guard = data.known_services.lock().await;
+                        if known_services_guard.insert(service_name.clone()) {
+                            new_service_detected_in_batch = true;
+                            info!("New service '{}' detected during OTLP ingestion", service_name);
+                        }
+                    } // Lock released
+
                     let mut map = serde_json::Map::new();
                     for kv in &log.attributes {
                         let val = match &kv.value {
@@ -227,7 +279,7 @@ async fn ingest_otlp(
                     let body_str = Value::Object(map).to_string();
                     if let Err(e) = tx.execute(
                         "INSERT INTO logs (ts, level, service, body) VALUES (?1, ?2, ?3, ?4)",
-                        (ts, level.clone(), service.clone(), body_str),
+                        (ts, level.clone(), service_name.clone(), body_str), // Use service_name
                     ).await {
                         error!("OTLP DB insert error: {:?}", e);
                         INGESTION_FAILURES.fetch_add(1, Ordering::SeqCst);
@@ -245,6 +297,21 @@ async fn ingest_otlp(
     tx.commit().await.unwrap();
     LOGS_INGESTED.fetch_add(count, Ordering::SeqCst);
     info!("OTLP Ingested {} records", count);
+
+    // Send notification if new services were added
+    if new_service_detected_in_batch {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/list_changed",
+            "params": {}
+        });
+        if let Err(e) = data.broadcaster.send(notification.to_string()) {
+            error!("Failed to send resources/list_changed notification (OTLP): {}", e);
+        } else {
+            info!("Sent notifications/resources/list_changed notification (OTLP)");
+        }
+    }
+
     HttpResponse::Ok().json(json!({"ingested": count}))
 }
 
@@ -347,33 +414,76 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
     };
     // Log parsed JSON-RPC request
     info!("MCP[POST] JSON-RPC request: method={}, id={:?}, params={:?}", req.method, req.id, req.params);
-    if req.method == "notifications/initialized" && req.id.is_none() {
-        // notification; nothing to do
-        return HttpResponse::Ok().finish();
-    }
-    if let Some(id) = req.id.clone() {
-        let mut response = json!({"jsonrpc": "2.0", "id": id.clone()});
+
+    const MCP_PAGE_SIZE: usize = 10;
+
+    // Handle Notifications (req.id is None)
+    if req.id.is_none() {
         match req.method.as_str() {
-            "initialize" => {
+            "notifications/initialized" => {
+                info!("Received notifications/initialized");
+                // Potentially clear any pending state related to a previous session if needed.
+            }
+            "notifications/cancelled" => {
+                let request_id_val = req.params.as_ref().and_then(|p| p.get("requestId")).cloned(); // Cloned to own Value
+                let reason_val = req.params.as_ref()
+                    .and_then(|p| p.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                info!("Received notifications/cancelled for requestId: {:?}, reason: {:?}", request_id_val, reason_val);
+                // Here, you might add logic to mark the corresponding request_id_val as cancelled
+                // if you are tracking cancellable operations.
+            }
+            // MCP specifies these are server-to-client, so server receiving them is an error.
+            "notifications/resources/list_changed" | 
+            "notifications/tools/list_changed" | 
+            "notifications/prompts/list_changed" | 
+            "notifications/message" | 
+            "notifications/roots/list_changed" | 
+            "notifications/resources/updated" => {
+                 error!("Server received unexpected client-bound notification: {}", req.method);
+            }
+            _ => {
+                warn!("Received unhandled notification: {}", req.method);
+            }
+        }
+        return HttpResponse::Ok().finish(); // All notifications get an empty 200 OK.
+    }
+
+    // Handle Requests (req.id is Some)
+    // req.id is definitely Some here, so we can unwrap it.
+    let id = req.id.expect("req.id should be Some for requests, this is a bug in logic flow.");
+    let mut response = json!({"jsonrpc": "2.0", "id": id.clone()}); // id.clone() because it's used in response
+
+    match req.method.as_str() {
+        "initialize" => {
                 response["result"] = json!({
                     "protocolVersion": "2025-03-26",
                     "capabilities": {
                         "tools": {"listChanged": false},
                         "logging": {},
                         "resources": {"subscribe": true, "listChanged": true},
-                        "prompts": {}
+                        "prompts": {"listChanged": false}, // Assuming prompts are static for now
+                        "completions": {} // Add completions capability
                     },
                     "serverInfo": {"name": "loggy", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": ""
                 });
             }
             "tools/list" => {
-                let tools = vec![
+                // Define all tools data (as it was before pagination)
+                let all_tools_data = vec![
                     json!({
                         "name": "list_services",
                         "description": "List all service names that have logged entries",
                         "inputSchema": { "type": "object", "properties": {}, "required": [] },
-                        "annotations": {"title": "List Services", "readOnlyHint": true, "openWorldHint": false}
+                        "annotations": {
+                            "title": "List Services",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        }
                     }),
                     json!({
                         "name": "search_logs",
@@ -387,7 +497,13 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                             },
                             "required": ["q"]
                         },
-                        "annotations": {"title": "Search Logs", "readOnlyHint": true, "openWorldHint": false}
+                        "annotations": {
+                            "title": "Search Logs",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        }
                     }),
                     json!({
                         "name": "get_log",
@@ -397,40 +513,90 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                             "properties": {"id": {"type": "integer", "description": "Log entry ID"}}, 
                             "required": ["id"]
                         },
-                        "annotations": {"title": "Get Log", "readOnlyHint": true, "openWorldHint": false}
+                        "annotations": {
+                            "title": "Get Log",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        }
                     }),
                     json!({
                         "name": "tail_logs",
                         "description": "Stream the last N lines (optionally filtered by service & level)",
                         "inputSchema": {"type": "object", "properties": {"service": {"type": "string"}, "level": {"type": "string"}, "lines": {"type": "integer"}}, "required": []},
-                        "annotations": {"title": "Tail Logs", "readOnlyHint": true, "idempotentHint": false}
+                        "annotations": {
+                            "title": "Tail Logs",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": false,
+                            "openWorldHint": false
+                        }
                     }),
                     json!({
                         "name": "search_logs_around",
                         "description": "Fetch log entries before & after a given ID",
                         "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "before": {"type": "integer"}, "after": {"type": "integer"}}, "required": ["id"]},
-                        "annotations": {"title": "Search Logs Around", "readOnlyHint": true}
+                        "annotations": {
+                            "title": "Search Logs Around",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        }
                     }),
                     json!({
                         "name": "summarize_logs",
                         "description": "Natural-language summary of logs over a time window",
                         "inputSchema": {"type": "object", "properties": {"service": {"type": "string"}, "level": {"type": "string"}, "minutes": {"type": "integer"}}, "required": ["minutes"]},
-                        "annotations": {"title": "Summarize Logs", "readOnlyHint": true}
+                        "annotations": {
+                            "title": "Summarize Logs",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        }
                     }),
                     json!({
                         "name": "get_metrics",
                         "description": "Fetch current ingestion and DB metrics",
                         "inputSchema": {"type": "object", "properties": {}, "required": []},
-                        "annotations": {"title": "Get Metrics", "readOnlyHint": true}
+                        "annotations": {
+                            "title": "Get Metrics",
+                            "readOnlyHint": true,
+                            "destructiveHint": false,
+                            "idempotentHint": true,
+                            "openWorldHint": false
+                        }
                     }),
                 ];
-                response["result"] = json!({"tools": tools});
+
+                let current_offset: usize = req.params.as_ref()
+                    .and_then(|p| p.get("cursor"))
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                let start_index = current_offset;
+                let end_index = std::cmp::min(start_index + MCP_PAGE_SIZE, all_tools_data.len());
+                
+                let page_tools = if start_index < end_index {
+                    all_tools_data[start_index..end_index].to_vec()
+                } else {
+                    vec![]
+                };
+
+                response["result"] = json!({"tools": page_tools});
+
+                if end_index < all_tools_data.len() {
+                    response["result"]["nextCursor"] = json!(end_index.to_string());
+                }
             }
             "tools/call" => {
-                if let Some(params) = &req.params {
+                if let Some(params_val) = &req.params { // Renamed to avoid conflict with shadowing 'params' if any
                     // Extract tool name and arguments
-                    let tool_name = params.get("name").and_then(Value::as_str);
-                    let args = params.get("arguments");
+                    let tool_name = params_val.get("name").and_then(Value::as_str);
+                    let args = params_val.get("arguments");
                     
                     if let Some(name) = tool_name {
                         match name {
@@ -449,44 +615,80 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                             },
                             "search_logs" => {
                                 if let Some(args_obj) = args {
-                                    let q = args_obj.get("q").and_then(Value::as_str).unwrap_or("");
-                                    let limit = args_obj.get("limit").and_then(Value::as_u64).unwrap_or(10);
-                                    let offset = args_obj.get("offset").and_then(Value::as_u64).unwrap_or(0);
-                                    
-                                    match search_logs(&data.conn, q, limit as i64, offset as i64).await {
-                                        Ok(results) => {
-                                            response["result"] = json!({"content": [{"type": "text", "text": results}]});
-                                        },
-                                        Err(e) => {
-                                            error!("Error searching logs: {:?}", e);
-                                            response["error"] = json!({"code": -32603, "message": "Database error"});
+                                    // Check for required 'q' parameter
+                                    if let Some(q_val) = args_obj.get("q") {
+                                        if let Some(q_str) = q_val.as_str() {
+                                            if q_str.is_empty() {
+                                                response["result"] = json!({
+                                                    "content": [{"type": "text", "text": "Error: Missing or empty 'q' parameter for tool search_logs"}],
+                                                    "isError": true
+                                                });
+                                            } else {
+                                                let limit = args_obj.get("limit").and_then(Value::as_u64).unwrap_or(10);
+                                                let offset = args_obj.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                                                match search_logs(&data.conn, q_str, limit as i64, offset as i64).await {
+                                                    Ok(results) => {
+                                                        response["result"] = json!({"content": [{"type": "text", "text": results}]});
+                                                    },
+                                                    Err(e) => {
+                                                        error!("Error searching logs: {:?}", e);
+                                                        response["error"] = json!({"code": -32603, "message": "Database error"});
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                             response["result"] = json!({
+                                                "content": [{"type": "text", "text": "Error: Invalid 'q' parameter, must be a string for tool search_logs"}],
+                                                "isError": true
+                                            });
                                         }
+                                    } else {
+                                        response["result"] = json!({
+                                            "content": [{"type": "text", "text": "Error: Missing 'q' parameter for tool search_logs"}],
+                                            "isError": true
+                                        });
                                     }
                                 } else {
-                                    response["error"] = json!({"code": -32602, "message": "Missing search query"});
+                                    response["result"] = json!({
+                                        "content": [{"type": "text", "text": "Error: Missing arguments for tool search_logs"}],
+                                        "isError": true
+                                    });
                                 }
                             },
                             "get_log" => {
                                 if let Some(args_obj) = args {
-                                    if let Some(id) = args_obj.get("id").and_then(Value::as_u64) {
-                                        match get_log_by_id(&data.conn, id as i64).await {
-                                            Ok(log_entry) => {
-                                                response["result"] = json!({"content": [{"type": "text", "text": log_entry}]});
-                                            },
-                                            Err(e) => {
-                                                error!("Error getting log: {:?}", e);
-                                                response["error"] = json!({"code": -32603, "message": "Database error"});
+                                    if let Some(id_val) = args_obj.get("id") {
+                                        if let Some(id_u64) = id_val.as_u64() {
+                                            match get_log_by_id(&data.conn, id_u64 as i64).await {
+                                                Ok(log_entry) => {
+                                                    response["result"] = json!({"content": [{"type": "text", "text": log_entry}]});
+                                                },
+                                                Err(e) => {
+                                                    error!("Error getting log: {:?}", e);
+                                                    response["error"] = json!({"code": -32603, "message": "Database error"});
+                                                }
                                             }
+                                        } else {
+                                            response["result"] = json!({
+                                                "content": [{"type": "text", "text": "Error: Invalid 'id' parameter, must be an integer for tool get_log"}],
+                                                "isError": true
+                                            });
                                         }
                                     } else {
-                                        response["error"] = json!({"code": -32602, "message": "Missing or invalid 'id' parameter"});
+                                        response["result"] = json!({
+                                            "content": [{"type": "text", "text": "Error: Missing 'id' parameter for tool get_log"}],
+                                            "isError": true
+                                        });
                                     }
                                 } else {
-                                    response["error"] = json!({"code": -32602, "message": "Missing arguments"});
+                                    response["result"] = json!({
+                                        "content": [{"type": "text", "text": "Error: Missing arguments for tool get_log"}],
+                                        "isError": true
+                                    });
                                 }
                             },
                             "tail_logs" => {
-                                if let Some(args_obj) = args {
+                                if let Some(args_obj) = args { // args can be an empty object {}
                                     let lines_n = args_obj.get("lines").and_then(Value::as_u64).unwrap_or(10) as i64;
                                     let service_opt = args_obj.get("service").and_then(Value::as_str);
                                     let level_opt = args_obj.get("level").and_then(Value::as_str);
@@ -500,49 +702,85 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                                         }
                                     }
                                 } else {
-                                    response["error"] = json!({"code": -32602, "message": "Missing arguments"});
+                                    // This case should ideally not be hit if inputSchema defines properties as optional.
+                                    // However, if `arguments` itself is missing, it's an issue.
+                                    response["result"] = json!({
+                                        "content": [{"type": "text", "text": "Error: Missing arguments for tool tail_logs"}],
+                                        "isError": true
+                                    });
                                 }
                             },
                             "search_logs_around" => {
                                 if let Some(args_obj) = args {
-                                    if let Some(id) = args_obj.get("id").and_then(Value::as_u64) {
-                                        let before_n = args_obj.get("before").and_then(Value::as_u64).unwrap_or(0) as i64;
-                                        let after_n = args_obj.get("after").and_then(Value::as_u64).unwrap_or(0) as i64;
-                                        match search_logs_around(&data.conn, id as i64, before_n, after_n).await {
-                                            Ok(text) => {
-                                                response["result"] = json!({"content": [{"type": "text", "text": text}]});
-                                            },
-                                            Err(e) => {
-                                                error!("Error fetching logs around: {:?}", e);
-                                                response["error"] = json!({"code": -32603, "message": "Database error"});
+                                    if let Some(id_val) = args_obj.get("id") {
+                                        if let Some(id_u64) = id_val.as_u64() {
+                                            let before_n = args_obj.get("before").and_then(Value::as_u64).unwrap_or(0) as i64;
+                                            let after_n = args_obj.get("after").and_then(Value::as_u64).unwrap_or(0) as i64;
+                                            match search_logs_around(&data.conn, id_u64 as i64, before_n, after_n).await {
+                                                Ok(text) => {
+                                                    response["result"] = json!({"content": [{"type": "text", "text": text}]});
+                                                },
+                                                Err(e) => {
+                                                    error!("Error fetching logs around: {:?}", e);
+                                                    response["error"] = json!({"code": -32603, "message": "Database error"});
+                                                }
                                             }
+                                        } else {
+                                            response["result"] = json!({
+                                                "content": [{"type": "text", "text": "Error: Invalid 'id' parameter, must be an integer for tool search_logs_around"}],
+                                                "isError": true
+                                            });
                                         }
                                     } else {
-                                        response["error"] = json!({"code": -32602, "message": "Missing or invalid 'id' parameter"});
+                                        response["result"] = json!({
+                                            "content": [{"type": "text", "text": "Error: Missing 'id' parameter for tool search_logs_around"}],
+                                            "isError": true
+                                        });
                                     }
                                 } else {
-                                    response["error"] = json!({"code": -32602, "message": "Missing arguments"});
+                                    response["result"] = json!({
+                                        "content": [{"type": "text", "text": "Error: Missing arguments for tool search_logs_around"}],
+                                        "isError": true
+                                    });
                                 }
                             },
                             "summarize_logs" => {
                                 if let Some(args_obj) = args {
-                                    let minutes = args_obj.get("minutes").and_then(Value::as_u64).unwrap_or(0) as i64;
-                                    let service_opt = args_obj.get("service").and_then(Value::as_str);
-                                    let level_opt = args_obj.get("level").and_then(Value::as_str);
-                                    match summarize_logs(&data.conn, service_opt, level_opt, minutes).await {
-                                        Ok(text) => {
-                                            response["result"] = json!({"content": [{"type": "text", "text": text}]});
-                                        },
-                                        Err(e) => {
-                                            error!("Error summarizing logs: {:?}", e);
-                                            response["error"] = json!({"code": -32603, "message": "Database error"});
+                                    if let Some(minutes_val) = args_obj.get("minutes") {
+                                        if let Some(minutes_u64) = minutes_val.as_u64(){
+                                            let service_opt = args_obj.get("service").and_then(Value::as_str);
+                                            let level_opt = args_obj.get("level").and_then(Value::as_str);
+                                            match summarize_logs(&data.conn, service_opt, level_opt, minutes_u64 as i64).await {
+                                                Ok(text) => {
+                                                    response["result"] = json!({"content": [{"type": "text", "text": text}]});
+                                                },
+                                                Err(e) => {
+                                                    error!("Error summarizing logs: {:?}", e);
+                                                    response["error"] = json!({"code": -32603, "message": "Database error"});
+                                                }
+                                            }
+                                        } else {
+                                            response["result"] = json!({
+                                                "content": [{"type": "text", "text": "Error: Invalid 'minutes' parameter, must be an integer for tool summarize_logs"}],
+                                                "isError": true
+                                            });
                                         }
+                                    } else {
+                                         response["result"] = json!({
+                                            "content": [{"type": "text", "text": "Error: Missing 'minutes' parameter for tool summarize_logs"}],
+                                            "isError": true
+                                        });
                                     }
                                 } else {
-                                    response["error"] = json!({"code": -32602, "message": "Missing arguments"});
+                                    response["result"] = json!({
+                                        "content": [{"type": "text", "text": "Error: Missing arguments for tool summarize_logs"}],
+                                        "isError": true
+                                    });
                                 }
                             },
                             "get_metrics" => {
+                                // This tool takes no arguments, so no specific argument error handling here.
+                                // The check for `args` not being None (if it were strictly enforced) would be outside.
                                 match get_metrics_text(&data.conn, &data.db_url).await {
                                     Ok(text) => {
                                         response["result"] = json!({"content": [{"type": "text", "text": text}]});
@@ -554,36 +792,99 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                                 }
                             },
                             _ => {
-                                response["error"] = json!({"code": -32601, "message": format!("Tool not found: {}", name)});
+                                response["result"] = json!({
+                                    "content": [{"type": "text", "text": format!("Error: Tool not found: {}", name)}],
+                                    "isError": true
+                                });
                             }
                         }
                     } else {
-                        response["error"] = json!({"code": -32602, "message": "Missing tool name"});
+                        response["result"] = json!({
+                            "content": [{"type": "text", "text": "Error: Missing tool name"}],
+                            "isError": true
+                        });
                     }
                 } else {
-                    response["error"] = json!({"code": -32602, "message": "Missing params"});
+                    response["result"] = json!({
+                        "content": [{"type": "text", "text": "Error: Missing params for tools/call"}],
+                        "isError": true
+                    });
                 }
             }
             "resources/list" => {
-                let mut resources = Vec::new();
-                // all logs snapshot
-                resources.push(json!({"uri": "file:///loggy/logs/all.log","name": "all.log","description": "All logs","mimeType": "text/plain"}));
-                // per-service logs
-                if let Ok(services) = list_distinct_services(&data.conn).await {
-                    for svc in services {
-                        resources.push(json!({
-                            "uri": format!("file:///loggy/logs/{}.log", svc),
-                            "name": format!("{}.log", svc),
-                            "description": format!("Log snapshot for {}", svc),
-                            "mimeType": "text/plain"
+                let current_offset: usize = req.params.as_ref()
+                    .and_then(|p| p.get("cursor"))
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                let mut resources_on_page = Vec::new();
+                let mut final_next_cursor: Option<usize> = None;
+
+                let static_resources_defs = [
+                    ("file:///loggy/logs/all.log", "all.log", "All logs", "text/plain"),
+                    ("file:///loggy/config.toml", "config.toml", "Loggy configuration", "text/plain"),
+                    ("file:///loggy/metrics.txt", "metrics.txt", "Metrics snapshot", "text/plain")
+                ];
+                let num_static_resources = static_resources_defs.len();
+
+                let mut effective_idx = current_offset;
+                while resources_on_page.len() < MCP_PAGE_SIZE {
+                    if effective_idx < num_static_resources {
+                        let (uri, name, description, mime_type) = static_resources_defs[effective_idx];
+                        let size = match name {
+                            "all.log" => fetch_all_logs_text(&data.conn).await.unwrap_or_default().len(),
+                            "config.toml" => format!("port = {}\ndb_url = \"{}\"\n", data.port, data.db_url).len(),
+                            "metrics.txt" => {
+                                let ing = LOGS_INGESTED.load(Ordering::SeqCst);
+                                let f = INGESTION_FAILURES.load(Ordering::SeqCst);
+                                let db_sz = if data.db_url == ":memory:" { 0 } else { fs::metadata(&data.db_url).map(|m| m.len()).unwrap_or(0) };
+                                format!("# HELP loggy_ingested_total...\nloggy_ingested_total {ingested}\n# HELP loggy_failed_ingestions_total...\nloggy_failed_ingestions_total {failed}\n# HELP loggy_db_size_bytes...\nloggy_db_size_bytes {db_size}\n", ingested=ing, failed=f, db_size=db_sz).len()
+                            },
+                            _ => 0, 
+                        };
+                        resources_on_page.push(json!({
+                            "uri": uri,
+                            "name": name,
+                            "description": description,
+                            "mimeType": mime_type,
+                            "size": size
                         }));
+                    } else {
+                        // Dynamic resource part
+                        let db_offset = effective_idx - num_static_resources;
+                        let services = list_distinct_services(&data.conn, 1, db_offset as i64).await.unwrap_or_default();
+                        if let Some(service_name) = services.get(0) {
+                            let service_logs_content = fetch_service_logs_text(&data.conn, service_name).await.unwrap_or_default();
+                            resources_on_page.push(json!({
+                                "uri": format!("file:///loggy/logs/{}.log", service_name),
+                                "name": format!("{}.log", service_name),
+                                "description": format!("Log snapshot for {}", service_name),
+                                "mimeType": "text/plain",
+                                "size": service_logs_content.len()
+                            }));
+                        } else {
+                            break; 
+                        }
+                    }
+                    effective_idx += 1;
+                }
+
+                // Check if there's a next item to determine nextCursor
+                if effective_idx < num_static_resources { 
+                    final_next_cursor = Some(effective_idx);
+                } else { 
+                    let db_offset_check = effective_idx - num_static_resources;
+                    let services_check = list_distinct_services(&data.conn, 1, db_offset_check as i64).await.unwrap_or_default();
+                    if !services_check.is_empty() {
+                        final_next_cursor = Some(effective_idx);
                     }
                 }
-                // configuration
-                resources.push(json!({"uri": "file:///loggy/config.toml","name": "config.toml","description": "Loggy configuration","mimeType": "text/plain"}));
-                // metrics snapshot
-                resources.push(json!({"uri": "file:///loggy/metrics.txt","name": "metrics.txt","description": "Metrics snapshot","mimeType": "text/plain"}));
-                response["result"] = json!({"resources": resources});
+
+                response["result"] = json!({"resources": resources_on_page});
+                if let Some(cursor_val) = final_next_cursor {
+                    response["result"]["nextCursor"] = json!(cursor_val.to_string());
+                }
             }
             "resources/read" => {
                 if let Some(p) = &req.params {
@@ -617,12 +918,125 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
                 }
             }
             "resources/templates/list" => {
-                let templates = vec![
-                    json!({"uriTemplate": "logquery:///{service}/{level}/{startTs}/{endTs}", "name": "Time Range Logs", "description": "Select logs for a given service & level between two ISO-8601 timestamps", "mimeType": "application/json"}),
-                    json!({"uriTemplate": "logentry:///{id}?before={n}&after={m}", "name": "Entry Drilldown", "description": "Fetch N entries before and M entries after a log ID", "mimeType": "application/json"}),
-                    json!({"uriTemplate": "file:///project/src/{path}", "name": "Source Code Files", "description": "Fetch source code snippets by path", "mimeType": "text/x-rust"}),
+                // Define all templates data (as it was before pagination)
+                let all_templates_data = vec![
+                    json!({
+                        "uriTemplate": "logquery:///{service}/{level}/{startTs}/{endTs}",
+                        "name": "Time Range Logs",
+                        "description": "Select logs for a given service & level between two ISO-8601 timestamps",
+                        "mimeType": "application/json",
+                        "annotations": {
+                            "audience": ["assistant"],
+                            "priority": 0.5
+                        }
+                    }),
+                    json!({
+                        "uriTemplate": "logentry:///{id}?before={n}&after={m}",
+                        "name": "Entry Drilldown",
+                        "description": "Fetch N entries before and M entries after a log ID",
+                        "mimeType": "application/json",
+                        "annotations": {
+                            "audience": ["assistant"],
+                            "priority": 0.5
+                        }
+                    }),
+                    json!({
+                        "uriTemplate": "file:///project/src/{path}",
+                        "name": "Source Code Files",
+                        "description": "Fetch source code snippets by path",
+                        "mimeType": "text/x-rust",
+                        "annotations": {
+                            "audience": ["assistant"],
+                            "priority": 0.5
+                        }
+                    }),
                 ];
-                response["result"] = json!({"resourceTemplates": templates});
+
+                let current_offset: usize = req.params.as_ref()
+                    .and_then(|p| p.get("cursor"))
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                let start_index = current_offset;
+                let end_index = std::cmp::min(start_index + MCP_PAGE_SIZE, all_templates_data.len());
+
+                let page_templates = if start_index < end_index {
+                    all_templates_data[start_index..end_index].to_vec()
+                } else {
+                    vec![]
+                };
+                
+                response["result"] = json!({"resourceTemplates": page_templates});
+
+                if end_index < all_templates_data.len() {
+                    response["result"]["nextCursor"] = json!(end_index.to_string());
+                }
+            }
+            "logging/setLevel" => {
+                match req.params.as_ref().and_then(|p| p.get("level")).and_then(Value::as_str) {
+                    Some(level_str) => {
+                        if VALID_LOG_LEVELS.contains(level_str) {
+                            let mut app_level = data.mcp_log_level.lock().await;
+                            *app_level = level_str.to_string();
+                            info!("MCP log level set to: {}", level_str);
+                            response["result"] = json!({});
+                        } else {
+                            response["error"] = json!({
+                                "code": INVALID_PARAMS,
+                                "message": format!("Invalid 'level' value: {}. Must be one of {:?}", level_str, *VALID_LOG_LEVELS)
+                            });
+                        }
+                    }
+                    None => {
+                        response["error"] = json!({
+                            "code": INVALID_PARAMS,
+                            "message": "Missing or invalid 'level' parameter. It must be a string."
+                        });
+                    }
+                }
+            }
+            "completion/complete" => {
+                match req.params.as_ref()
+                    .and_then(|p| p.get("argument"))
+                    .and_then(|a| a.get("value"))
+                    .and_then(Value::as_str)
+                {
+                    Some(partial_value_str) => {
+                        let partial_value_lower = partial_value_str.to_lowercase();
+
+                        // Static list of tool names for this basic implementation
+                        let tool_names = vec![
+                            "list_services", "search_logs", "get_log", 
+                            "tail_logs", "search_logs_around", "summarize_logs", 
+                            "get_metrics"
+                        ];
+
+                        let suggested_values: Vec<String> = tool_names
+                            .into_iter()
+                            .filter(|name| name.to_lowercase().starts_with(&partial_value_lower))
+                            .map(String::from) 
+                            .collect();
+
+                        let original_suggestion_count = suggested_values.len();
+                        let limited_values: Vec<String> = suggested_values.into_iter().take(100).collect();
+                        let has_more = original_suggestion_count > limited_values.len();
+
+                        response["result"] = json!({
+                            "completion": {
+                                "values": limited_values,
+                                "total": original_suggestion_count,
+                                "hasMore": has_more
+                            }
+                        });
+                    }
+                    None => {
+                        response["error"] = json!({
+                            "code": INVALID_PARAMS,
+                            "message": "Missing or invalid 'argument.value' parameter for completion/complete. It must be a string."
+                        });
+                    }
+                }
             }
             "resources/subscribe" => {
                 if let Some(p) = &req.params {
@@ -644,12 +1058,16 @@ async fn mcp_post(body: String, data: web::Data<AppState>) -> impl Responder {
         // Respond synchronously with JSON-RPC response
         return HttpResponse::Ok().json(response);
     }
-    HttpResponse::Ok().finish()
+    // Fallback if somehow a request (id=Some) does not match any method,
+    // though the `_` case in the match should ideally handle "Method not found".
+    // This line might be unreachable if the match covers all possibilities or has a proper default.
+    warn!("Request with id {:?} did not match any known method and wasn't handled by default.", id);
+    HttpResponse::InternalServerError().body("Unhandled request method despite having an ID.")
 }
 
 // Helper functions for tool implementation
-async fn list_distinct_services(conn: &Connection) -> Result<Vec<String>, libsql::Error> {
-    let mut rows = conn.query("SELECT DISTINCT service FROM logs ORDER BY service", ()).await?;
+async fn list_distinct_services(conn: &Connection, limit: i64, offset: i64) -> Result<Vec<String>, libsql::Error> {
+    let mut rows = conn.query("SELECT DISTINCT service FROM logs ORDER BY service LIMIT ? OFFSET ?", libsql::params![limit, offset]).await?;
     let mut services = Vec::new();
     
     while let Some(row) = rows.next().await? {
@@ -887,7 +1305,31 @@ async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt::init();
     let conn = init_db(&config.db_url).await;
     let (broadcaster_tx, _) = channel(100);
-    let state = web::Data::new(AppState { conn, db_url: config.db_url.clone(), broadcaster: broadcaster_tx.clone(), port: config.port });
+
+    // Initialize known_services
+    let mut initial_services = HashSet::new();
+    match list_distinct_services(&conn, -1, 0).await { // Fetch all for initial population
+        Ok(services) => {
+            for service in services {
+                initial_services.insert(service);
+            }
+            info!("Initialized known_services with {} existing services", initial_services.len());
+        }
+        Err(e) => {
+            error!("Failed to query existing services for known_services: {:?}", e);
+            // Continue with an empty set, notifications will be sent for all services initially.
+        }
+    }
+    let known_services_mutex = Mutex::new(initial_services);
+
+    let state = web::Data::new(AppState {
+        conn,
+        db_url: config.db_url.clone(),
+        broadcaster: broadcaster_tx.clone(),
+        port: config.port,
+        known_services: known_services_mutex,
+        mcp_log_level: Mutex::new("info".to_string()),
+    });
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
